@@ -57,7 +57,7 @@ services:
   # Qdrant Vector Database
   # ---------------------------------------------------------------------------
   qdrant:
-    image: qdrant/qdrant:v1.13
+    image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
     container_name: fraudai-qdrant
     ports:
       - "127.0.0.1:6333:6333"
@@ -81,7 +81,7 @@ services:
   # Ollama Local LLM (Donna routing + simple queries)
   # ---------------------------------------------------------------------------
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.40.15@sha256:0e59999e0e8f9fd4e704bd788a89b7e4cad399367fb1365f8c102ac662288761
     container_name: fraudai-ollama
     ports:
       - "127.0.0.1:11434:11434"
@@ -108,7 +108,7 @@ services:
   # Prometheus — Metrics Collection & Alerting
   # ---------------------------------------------------------------------------
   prometheus:
-    image: prom/prometheus:v2.53.0
+    image: prom/prometheus:v2.53.0@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc
     container_name: fraudai-prometheus
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
@@ -141,7 +141,7 @@ services:
   # Grafana — Dashboards & Visualization
   # ---------------------------------------------------------------------------
   grafana:
-    image: grafana/grafana:11.1.0
+    image: grafana/grafana:11.1.0@sha256:079600c9517b678c10cda6006b4487d3174512fd4c6cface37df7822756ed7a5
     container_name: fraudai-grafana
     ports:
       - "${GRAFANA_PORT:-3000}:3000"

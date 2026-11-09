@@ -2,7 +2,7 @@
 name = "fraudai-agent"
 version = "0.1.0"
 description = "AI agentic platform for banking fraud detection and AI red teaming in FinTech"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 license = "MIT"
 authors = [
     { name = "Adrian Infantes" },
@@ -31,9 +31,16 @@ dependencies = [
     "langchain-groq>=1.1.2",
     "PyJWT>=2.9",
     "aiosqlite>=0.20",
+    # Direct pin of the transitive torch (via sentence-transformers) so that
+    # [tool.uv.sources] can route Linux to the CPU-only wheel index.
+    "torch>=2.0",
 ]
 
 [project.optional-dependencies]
+# Optional OpenAI backend used by agents/claude_invoker.py (lazy import).
+openai = [
+    "langchain-openai>=0.3",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
@@ -44,8 +51,21 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+# uv.lock does NOT pin PEP 517 build requirements. These exact constraints pin the
+# build backend and its transitive deps (resolved 2026-11-09 for Python 3.11:
+# `uv pip compile` of hatchling==1.33.0) for every isolated project build.
+build-constraint-dependencies = [
+    "hatchling==1.33.0",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.7.0",
+    "tomlkit==0.15.2",
+    "trove-classifiers==2026.9.21.13",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fraudai"]
@@ -68,8 +88,41 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
+# Source files carry legacy `# type: ignore[...]` comments that become "unused"
+# depending on installed extras (e.g. langchain-groq / langchain-openai typing).
+# Source edits are out of scope for F2; this mirrors the previous CI flag
+# (--no-warn-unused-ignores) but is declared here, not on the command line.
+warn_unused_ignores = false
+
+# Explicit, per-module exceptions for third-party packages that ship neither
+# type hints nor a stub package. NO global ignore_missing_imports.
+[[tool.mypy.overrides]]
+module = ["docker", "docker.*"]
+# types-docker is obsolete (docker SDK has no py.typed); untyped import only.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*"]
+# scikit-learn ships no py.typed marker nor stubs.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["FlagEmbedding"]
+# Optional, lazily imported reranker/embedder; not a project dependency.
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+
+# Linux (CI / Docker) installs CPU-only torch: the default PyPI Linux wheel
+# drags ~3 GB of nvidia-*/triton CUDA packages (10 GB image) that no code path
+# here uses. macOS keeps the PyPI wheel.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

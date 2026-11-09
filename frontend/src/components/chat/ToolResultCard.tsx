@@ -42,16 +42,18 @@ const COLLAPSE_THRESHOLD = 200;
 
 export function ToolResultCard({ result: resultProp, toolResult }: ToolResultCardProps) {
   const result = resultProp ?? toolResult;
-  if (!result) return null;
-  const style = STATUS_STYLES[result.status];
-  const resultJson = result.result
+  const resultJson = result?.result
     ? JSON.stringify(result.result, null, 2)
     : null;
 
   const isLargeResult =
     resultJson !== null && resultJson.length > COLLAPSE_THRESHOLD;
 
+  // Hooks must run before any early return (rules-of-hooks).
   const [expanded, setExpanded] = useState(!isLargeResult);
+
+  if (!result) return null;
+  const style = STATUS_STYLES[result.status];
 
   return (
     <div

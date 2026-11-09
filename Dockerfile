@@ -1,54 +1,64 @@
 # =============================================================================
-# FraudAI Agent -- Production Dockerfile (multi-stage)
+# FraudAI Agent -- Production Dockerfile (multi-stage, reproducible)
 #
 # Build:  docker build -t fraudai-agent:latest .
 # Run:    docker run -p 8000:8000 --env-file .env fraudai-agent:latest
 #
-# Target image size: < 500 MB (python:3.11-slim base ~150 MB)
+# Reproducibility: external base images are pinned by multi-platform index
+# digest (linux/amd64 + linux/arm64) and dependencies are installed from the
+# committed uv.lock with `uv sync --frozen`.
+# NOTE: sentence-transformers pulls torch, so the image is far above 500 MB.
 # Reference: ADR-006
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# Stage 1: Builder -- install dependencies with uv
+# Stage 1: Builder -- install locked dependencies + the project (non-editable)
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim AS builder
+FROM python:3.11.18-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39 AS builder
 
 WORKDIR /app
 
-# System deps for building Python packages (numpy, scikit-learn, etc.)
+# System deps for building Python packages that lack wheels
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc g++ && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast dependency resolution
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# uv pinned by digest (0.12.19)
+COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /usr/local/bin/uv
 
-# Copy dependency specification + source (needed for package install)
-COPY pyproject.toml ./
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never
+
+# 1) Third-party deps only (cached layer; depends solely on the lock files)
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --no-editable
+
+# 2) The project itself, installed into the venv (NOT editable: no link to /app/src)
 COPY src/ ./src/
-
-# Install production dependencies (no dev extras)
-RUN uv pip install --system --no-cache . && \
+RUN uv sync --frozen --no-dev --no-editable && \
     rm -rf /root/.cache
 
 # ---------------------------------------------------------------------------
-# Stage 2: Runtime -- minimal image with only what's needed
+# Stage 2: Runtime -- minimal image with only the virtualenv
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim AS runtime
+FROM python:3.11.18-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39 AS runtime
 
 WORKDIR /app
 
 # Runtime system deps (curl for Docker healthcheck)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    # Base-image build tooling (setuptools/wheel + vendored jaraco.context) is not
+    # used at runtime (app runs from /opt/venv) and carries fixable HIGH CVEs.
+    pip uninstall -y setuptools wheel
 
-# Copy installed Python packages from builder
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
-
-# Copy application source only (no tests, docs, notebooks, etc.)
-COPY --from=builder /app/src ./src
+# Locked virtualenv (contains the installed fraudai package)
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
 
 # Non-root user for security
 RUN useradd -m -s /bin/bash -u 1000 fraudai

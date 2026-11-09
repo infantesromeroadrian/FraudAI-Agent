@@ -73,8 +73,7 @@ Thumbs.db
 # Logs
 *.log
 
-# Lock files (deps resolved in builder stage)
-uv.lock
+# NOTE: uv.lock MUST stay in the context (uv sync --frozen)
 
 # Scripts (deployment scripts not needed inside app image)
 scripts/
