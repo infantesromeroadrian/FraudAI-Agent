@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
@@ -42,21 +42,26 @@ class Settings(BaseSettings):
 
     # App
     log_level: str = "INFO"
-    environment: str = "development"
+    # Closed set: a typo such as "prod" or "PRODUCTION" must fail at startup
+    # instead of silently skipping the production-only checks.
+    environment: Literal["development", "staging", "production"] = "development"
     cors_allowed_origins: str = "http://localhost:3000"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     @model_validator(mode="after")
-    def _require_real_jwt_secret_in_production(self) -> Self:
-        """Refuse to start in production with a placeholder or short JWT secret."""
-        if self.environment == "production" and (
+    def _require_real_jwt_secret_outside_development(self) -> Self:
+        """Refuse to start in staging or production with a placeholder or short JWT secret.
+
+        Anyone who knows the public default could otherwise sign valid tokens.
+        """
+        if self.environment != "development" and (
             self.jwt_secret in _PLACEHOLDER_JWT_SECRETS
             or len(self.jwt_secret) < _MIN_JWT_SECRET_LENGTH
         ):
             msg = (
                 "JWT_SECRET must be set to a random value of at least "
-                f"{_MIN_JWT_SECRET_LENGTH} characters when ENVIRONMENT=production"
+                f"{_MIN_JWT_SECRET_LENGTH} characters when ENVIRONMENT={self.environment}"
             )
             raise ValueError(msg)
         return self

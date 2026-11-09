@@ -7,6 +7,7 @@ Uses httpx.AsyncClient with ASGITransport for async test client.
 from __future__ import annotations
 
 import io
+import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +17,7 @@ from fastapi import FastAPI
 from langchain_core.messages import AIMessage, HumanMessage
 
 from fraudai.api.auth import User
-from fraudai.api.session_manager import SessionData, SessionManager
+from fraudai.api.session_manager import SessionManager
 
 # Test placeholder -- not a real credential
 _TEST_ANTHROPIC_PLACEHOLDER = "test-not-a-real-key"
@@ -462,17 +463,13 @@ async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
 async def test_get_session_tenant_isolation(
     client: httpx.AsyncClient, session_manager: SessionManager
 ) -> None:
-    """Get session from a different tenant returns 403."""
-    # Create session owned by a different tenant
-    session_manager._sessions["other-session"] = SessionData(
-        session_id="other-session",
-        tenant_id="other-tenant",
-        tier="free",
-    )
+    """A session of another tenant is indistinguishable from an unknown one (404)."""
+    foreign_id = session_manager.create_session(tenant_id="other-tenant", tier="free")
 
-    resp = await client.get("/api/v1/sessions/other-session")
-    assert resp.status_code == 403
-    assert "different tenant" in resp.json()["detail"]
+    resp = await client.get(f"/api/v1/sessions/{foreign_id}")
+    assert resp.status_code == 404
+    unknown = await client.get(f"/api/v1/sessions/{uuid.uuid4()}")
+    assert resp.json() == unknown.json()
 
 
 # ---------------------------------------------------------------------------
@@ -504,15 +501,12 @@ async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
 async def test_delete_session_tenant_isolation(
     client: httpx.AsyncClient, session_manager: SessionManager
 ) -> None:
-    """Delete session from a different tenant returns 403."""
-    session_manager._sessions["other-session"] = SessionData(
-        session_id="other-session",
-        tenant_id="other-tenant",
-        tier="free",
-    )
+    """Delete of another tenant's session is rejected and leaves it intact."""
+    foreign_id = session_manager.create_session(tenant_id="other-tenant", tier="free")
 
-    resp = await client.delete("/api/v1/sessions/other-session")
-    assert resp.status_code == 403
+    resp = await client.delete(f"/api/v1/sessions/{foreign_id}")
+    assert resp.status_code == 404
+    assert session_manager.get_session(foreign_id) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -615,12 +609,15 @@ async def test_confirm_failure_returns_500(
 # ---------------------------------------------------------------------------
 
 
-async def test_submit_feedback(client: httpx.AsyncClient, app: FastAPI) -> None:
+async def test_submit_feedback(
+    client: httpx.AsyncClient, app: FastAPI, session_manager: SessionManager
+) -> None:
     """Feedback submission returns 201 with feedback_id."""
+    sid = session_manager.create_session(tenant_id="test-tenant", tier="pro")
     resp = await client.post(
         "/api/v1/feedback",
         json={
-            "session_id": "session-001",
+            "session_id": sid,
             "message_id": "msg-001",
             "rating": 5,
             "comment": "Very helpful analysis",
@@ -639,12 +636,15 @@ async def test_submit_feedback(client: httpx.AsyncClient, app: FastAPI) -> None:
     assert entry["user_id"] == "test-user-001"
 
 
-async def test_submit_feedback_minimum_rating(client: httpx.AsyncClient) -> None:
+async def test_submit_feedback_minimum_rating(
+    client: httpx.AsyncClient, session_manager: SessionManager
+) -> None:
     """Feedback with rating=1 is accepted."""
+    sid = session_manager.create_session(tenant_id="test-tenant", tier="pro")
     resp = await client.post(
         "/api/v1/feedback",
         json={
-            "session_id": "session-001",
+            "session_id": sid,
             "message_id": "msg-001",
             "rating": 1,
         },

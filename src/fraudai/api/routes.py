@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import tempfile
 import time
 import uuid
 from datetime import UTC, datetime
@@ -21,10 +20,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx as httpx_client
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from fraudai.api.auth import User, create_token, get_admin_user, get_current_user
 from fraudai.api.schemas import (
@@ -40,7 +41,11 @@ from fraudai.api.schemas import (
     TokenResponse,
     ToolResult,
 )
+from fraudai.api.session_manager import (
+    SessionData,  # noqa: TC001 - FastAPI resolves dependency annotations at runtime
+)
 from fraudai.core.config import settings
+from fraudai.core.session_context import bind_session, is_valid_session_id, upload_dir
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -61,6 +66,10 @@ router = APIRouter()
 
 ALLOWED_EXTENSIONS = {".csv", ".json", ".pdf", ".txt"}
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+UPLOAD_READ_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+# Room for multipart boundaries and part headers on top of the file bytes.
+MULTIPART_OVERHEAD_ALLOWANCE = 64 * 1024
+MAX_UPLOADS_PER_SESSION = 20
 
 
 def _get_graph(request: Request) -> CompiledStateGraph:  # type: ignore[type-arg]
@@ -85,6 +94,65 @@ def _get_feedback_store(request: Request) -> list[dict[str, Any]]:
     """Extract the feedback store from app state."""
     store: list[dict[str, Any]] = request.app.state.feedback_store
     return store
+
+
+def _session_not_found() -> HTTPException:
+    # One response for "unknown", "malformed" and "someone else's": a distinct
+    # 403 would let a caller probe which session IDs exist in other tenants.
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Session not found.",
+    )
+
+
+def _owned_session(session_mgr: SessionManager, session_id: str, user: User) -> SessionData:
+    """Return the session if it is server-issued and belongs to the user's tenant.
+
+    Isolation is per tenant (SR-009): every user of a tenant may use the
+    tenant's sessions. Must run before the graph or the filesystem is touched.
+
+    Raises:
+        HTTPException 404: malformed, unknown or foreign session ID.
+    """
+    if not is_valid_session_id(session_id):
+        raise _session_not_found()
+    session = session_mgr.get_session(session_id)
+    if session is None:
+        raise _session_not_found()
+    if session.tenant_id != user.tenant_id:
+        logger.warning(
+            "cross_tenant_session_access_denied: user=%s, tenant=%s, session=%s",
+            user.user_id,
+            user.tenant_id,
+            session_id,
+        )
+        raise _session_not_found()
+    return session
+
+
+async def require_session_owner(
+    session_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+) -> SessionData:
+    """Dependency for routes that carry ``session_id`` in the path or query.
+
+    Routes that carry it in the body call ``_owned_session`` first instead.
+    """
+    return _owned_session(_get_session_manager(request), session_id, user)
+
+
+def _resolve_chat_session(
+    session_mgr: SessionManager, requested_id: str | None, user: User
+) -> SessionData:
+    """Create a session for a new conversation or authorize the requested one."""
+    if requested_id is None:
+        new_id = session_mgr.create_session(tenant_id=user.tenant_id, tier=user.tier)
+        created = session_mgr.get_session(new_id)
+        if created is None:  # evicted between create and get: cannot happen single-threaded
+            raise _session_not_found()
+        return created
+    return _owned_session(session_mgr, requested_id, user)
 
 
 def _extract_citations(state: dict[str, Any]) -> list[Citation]:
@@ -163,19 +231,19 @@ async def login(
     """Issue a JWT access token via OAuth2 password grant.
 
     **MVP behaviour:**
-    In ``development`` and ``staging`` environments, any credentials are
-    accepted and a valid JWT is returned.  This lets the frontend and
-    integration tests obtain real tokens without a user store.
+    In the ``development`` environment only, any credentials are accepted
+    and a valid JWT is returned.  This lets the frontend and integration
+    tests obtain real tokens without a user store.
 
-    In ``production``, returns HTTP 501 until a proper user store is
-    wired (Phase F6).
+    In ``staging`` and ``production``, returns HTTP 501 until a proper user
+    store is wired (Phase F5).
 
     The returned token can be passed as ``Authorization: Bearer <token>``
     to all authenticated endpoints.
     """
     from fraudai.api.auth import JWT_EXPIRATION_HOURS
 
-    if settings.environment in ("development", "staging"):
+    if settings.environment == "development":
         token = create_token(
             user_id=username,
             tenant_id="default",
@@ -219,17 +287,13 @@ async def chat(
     session_mgr = _get_session_manager(request)
     start_time = time.monotonic()
 
-    # Session management
-    session_id = request_body.session_id
-    if session_id is None:
-        session_id = session_mgr.create_session(tenant_id=user.tenant_id, tier=user.tier)
-    elif session_mgr.get_session(session_id) is None:
-        session_mgr.ensure_session(session_id, user.tenant_id, user.tier)
+    # Session management: authorize before anything reaches the graph.
+    session_data = _resolve_chat_session(session_mgr, request_body.session_id, user)
+    session_id = session_data.session_id
 
     # Get previous agent from session history for conversational continuity
-    session_data = session_mgr.get_session(session_id)
     previous_agent = None
-    if session_data and session_data.agent_history:
+    if session_data.agent_history:
         previous_agent = session_data.agent_history[-1]
 
     # Build input state — reset current_agent so Donna re-classifies each turn
@@ -251,7 +315,8 @@ async def chat(
     config = cast("RunnableConfig", {"configurable": {"thread_id": session_id}})
 
     try:
-        final_state = await graph.ainvoke(input_state, config=config)
+        with bind_session(session_id):
+            final_state = await graph.ainvoke(input_state, config=config)
     except Exception as exc:
         logger.exception("Graph invocation failed for session %s", session_id)
         raise HTTPException(
@@ -304,12 +369,8 @@ async def chat_stream(
     graph = _get_graph(request)
     session_mgr = _get_session_manager(request)
 
-    # Session management
-    session_id = request_body.session_id
-    if session_id is None:
-        session_id = session_mgr.create_session(tenant_id=user.tenant_id, tier=user.tier)
-    elif session_mgr.get_session(session_id) is None:
-        session_mgr.ensure_session(session_id, user.tenant_id, user.tier)
+    # Session management: authorize before the stream (and the graph) starts.
+    session_id = _resolve_chat_session(session_mgr, request_body.session_id, user).session_id
 
     input_state: dict[str, Any] = {
         "messages": [HumanMessage(content=request_body.message)],
@@ -326,7 +387,7 @@ async def chat_stream(
 
     config = cast("RunnableConfig", {"configurable": {"thread_id": session_id}})
 
-    async def event_generator() -> AsyncGenerator[str, None]:
+    async def stream_events() -> AsyncGenerator[str, None]:
         accumulated_content = ""
         agent_name = "donna"
         tool_results_acc: list[dict[str, Any]] = []
@@ -417,6 +478,13 @@ async def chat_stream(
             error_payload = {"type": "error", "message": str(exc)}
             yield f"data: {json.dumps(error_payload)}\n\n"
 
+    async def event_generator() -> AsyncGenerator[str, None]:
+        # The generator runs after this handler returned, so the session must
+        # be bound here, inside the task that actually drives the graph.
+        with bind_session(session_id):
+            async for chunk in stream_events():
+                yield chunk
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -433,17 +501,104 @@ async def chat_stream(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/files/upload", response_model=FileUploadResponse)
+def _file_too_large() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail=f"File too large. Maximum: {MAX_FILE_SIZE} bytes (100 MB).",
+    )
+
+
+async def _bounded_body(request: Request) -> AsyncGenerator[bytes, None]:
+    """Yield the request body, aborting once it exceeds the upload budget.
+
+    Counts bytes as they arrive, so a body without ``Content-Length`` (chunked)
+    is cut at the limit instead of being materialised by the multipart parser.
+    """
+    budget = MAX_FILE_SIZE + MULTIPART_OVERHEAD_ALLOWANCE
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > budget:
+            raise _file_too_large()
+        yield chunk
+
+
+async def _receive_upload(request: Request) -> tuple[str, bytes]:
+    """Parse the multipart body of an already-authorized upload.
+
+    The body is parsed here, not by FastAPI's ``UploadFile`` parameter, because
+    FastAPI would parse the whole body before the ownership dependency runs.
+
+    Returns:
+        ``(client filename, file bytes)``; the bytes never exceed ``MAX_FILE_SIZE``.
+
+    Raises:
+        HTTPException: 400 malformed body, 413 too large, 415 wrong content type,
+            422 missing ``file`` part.
+    """
+    content_type = request.headers.get("content-type", "").lower()
+    if not content_type.startswith("multipart/form-data"):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Expected multipart/form-data.",
+        )
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        if not declared.isdigit():
+            raise HTTPException(status_code=400, detail="Invalid Content-Length.")
+        if int(declared) > MAX_FILE_SIZE + MULTIPART_OVERHEAD_ALLOWANCE:
+            raise _file_too_large()
+
+    parser = MultiPartParser(request.headers, _bounded_body(request), max_files=1, max_fields=10)
+    try:
+        form = await parser.parse()
+    except MultiPartException as exc:
+        raise HTTPException(status_code=400, detail="Malformed multipart body.") from exc
+
+    try:
+        part = form.get("file")
+        if not isinstance(part, UploadFile):
+            raise HTTPException(status_code=422, detail="Missing 'file' part.")
+        if part.size is not None and part.size > MAX_FILE_SIZE:
+            raise _file_too_large()
+        buffer = bytearray()
+        while block := await part.read(UPLOAD_READ_CHUNK_SIZE):
+            buffer.extend(block)
+            if len(buffer) > MAX_FILE_SIZE:
+                raise _file_too_large()
+        return part.filename or "unnamed", bytes(buffer)
+    finally:
+        await form.close()
+
+
+_UPLOAD_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["file"],
+                    "properties": {"file": {"type": "string", "format": "binary"}},
+                }
+            }
+        },
+    }
+}
+
+
+@router.post("/files/upload", response_model=FileUploadResponse, openapi_extra=_UPLOAD_OPENAPI)
 async def upload_file(
-    file: UploadFile,
-    session_id: str,
     request: Request,
-    user: User = Depends(get_current_user),
+    session: SessionData = Depends(require_session_owner),
 ) -> FileUploadResponse:
     """Upload a document for session context.
 
+    ``session_id`` is a query parameter; the file is the ``file`` part of a
+    multipart body. The session must be server-issued and owned by the caller's
+    tenant, and that is checked before any byte of the body is read.
     Accepted formats: CSV, JSON, PDF, TXT.
-    Maximum file size: 100 MB (SR-008).
+    Maximum file size: 100 MB (SR-008), enforced while receiving the body.
 
     The file is indexed into an ephemeral Qdrant collection scoped to the
     session (T-RAG-04). Indexing target: < 30 s (SR-007).
@@ -451,8 +606,15 @@ async def upload_file(
     store = _get_store(request)
     session_mgr = _get_session_manager(request)
 
-    # Validate file extension
-    filename = file.filename or "unnamed"
+    if len(session.uploaded_files) >= MAX_UPLOADS_PER_SESSION:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Upload limit reached ({MAX_UPLOADS_PER_SESSION} files per session).",
+        )
+
+    filename, content = await _receive_upload(request)
+    size_bytes = len(content)
+
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -463,27 +625,20 @@ async def upload_file(
             ),
         )
 
-    # Read and validate file size
-    content = await file.read()
-    size_bytes = len(content)
-    if size_bytes > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large ({size_bytes} bytes). Maximum: {MAX_FILE_SIZE} bytes (100 MB).",
-        )
+    # Use the stored (server-issued) ID, never the raw request value, for paths.
+    session_id = session.session_id
 
-    # Save to temp directory (sanitize filename to prevent path traversal)
+    # The on-disk name is server-generated; the client filename never reaches
+    # the filesystem, so it cannot traverse or collide.
     file_id = str(uuid.uuid4())
-    safe_filename = Path(filename).name  # Strip directory components
-    tmp_dir = Path(tempfile.gettempdir()) / "fraudai_uploads" / session_id
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    file_path = tmp_dir / f"{file_id}_{safe_filename}"
+    session_dir = upload_dir(session_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    file_path = session_dir / f"{file_id}{suffix}"
     file_path.write_bytes(content)
 
     logger.info(
-        "File saved: file_id=%s, filename=%s, size=%d, session=%s",
+        "File saved: file_id=%s, size=%d, session=%s",
         file_id,
-        filename,
         size_bytes,
         session_id,
     )
@@ -596,31 +751,13 @@ def _split_paragraphs(
 
 @router.get("/sessions/{session_id}", response_model=SessionInfo)
 async def get_session(
-    session_id: str,
-    request: Request,
-    user: User = Depends(get_current_user),
+    session: SessionData = Depends(require_session_owner),
 ) -> SessionInfo:
     """Get session information and history.
 
     Returns metadata, agent interaction history, and uploaded file
     references. Scoped to the authenticated user's tenant (SR-009).
     """
-    session_mgr = _get_session_manager(request)
-    session = session_mgr.get_session(session_id)
-
-    if session is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{session_id}' not found.",
-        )
-
-    # Tenant isolation check
-    if session.tenant_id != user.tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: session belongs to a different tenant.",
-        )
-
     return SessionInfo(
         session_id=session.session_id,
         created_at=session.created_at,
@@ -632,8 +769,8 @@ async def get_session(
 
 @router.delete("/sessions/{session_id}", status_code=204)
 async def delete_session(
-    session_id: str,
     request: Request,
+    session: SessionData = Depends(require_session_owner),
     user: User = Depends(get_current_user),
 ) -> None:
     """Delete a session and all associated data.
@@ -646,19 +783,7 @@ async def delete_session(
     session_mgr = _get_session_manager(request)
     store = _get_store(request)
 
-    session = session_mgr.get_session(session_id)
-    if session is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{session_id}' not found.",
-        )
-
-    # Tenant isolation check
-    if session.tenant_id != user.tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: session belongs to a different tenant.",
-        )
+    session_id = session.session_id
 
     # Delete Qdrant session collection
     try:
@@ -701,14 +826,17 @@ async def confirm_action(
     session_mgr = _get_session_manager(request)
     start_time = time.monotonic()
 
-    session_id = request_body.session_id
+    # Ownership first: resuming a foreign thread would execute its pending action.
+    # Binding ``action_id`` to the pending interrupt is F4.
+    session_id = _owned_session(session_mgr, request_body.session_id, user).session_id
     config = cast("RunnableConfig", {"configurable": {"thread_id": session_id}})
 
     try:
-        final_state = await graph.ainvoke(
-            Command(resume={"approved": request_body.approved}),
-            config=config,
-        )
+        with bind_session(session_id):
+            final_state = await graph.ainvoke(
+                Command(resume={"approved": request_body.approved}),
+                config=config,
+            )
     except Exception as exc:
         logger.exception("Confirmation resume failed for session %s", session_id)
         raise HTTPException(
@@ -753,6 +881,8 @@ async def submit_feedback(
     Feedback is stored for continuous evaluation and prompt tuning.
     """
     feedback_store = _get_feedback_store(request)
+    session_mgr = _get_session_manager(request)
+    _owned_session(session_mgr, request_body.session_id, user)
 
     entry: dict[str, Any] = {
         "feedback_id": str(uuid.uuid4()),
