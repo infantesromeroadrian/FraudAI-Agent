@@ -51,7 +51,7 @@ Agents can call tools (transaction analysis, compliance reports, network graphs,
 - **Sandbox engine** that starts ephemeral Docker containers with `cap_drop=ALL` and `no-new-privileges` ([`sandbox.py`](src/fraudai/tools/sandbox.py)). Network is disabled by default; red-team tools turn it on ([`implementations.py`](src/fraudai/tools/implementations.py)).
 - **LLM invoker** for Anthropic, Groq and OpenAI-compatible providers ([`claude_invoker.py`](src/fraudai/agents/claude_invoker.py)). The Donna router additionally supports a local Ollama model ([`donna.py`](src/fraudai/agents/donna.py)).
 - **JWT authentication** ([`auth.py`](src/fraudai/api/auth.py)); the token carries a `tier` claim, but no per-tier access enforcement is implemented yet.
-- **Prometheus + Grafana** monitoring config with alert rules in [`monitoring/alerts/rules.yml`](monitoring/alerts/rules.yml); some rules may not match metrics the application actually emits (pending review).
+- **Prometheus + Grafana** monitoring config with alert rules in [`monitoring/alerts/rules.yml`](monitoring/alerts/rules.yml); several rules are known to be inert (see the [status table](#implementation-status)).
 
 ---
 
@@ -154,7 +154,7 @@ tests/             # unit/integration tests + live smoke tests (need a running b
 | [Backlog (F0.5)](docs/F0.5_backlog.md) | 74 user stories, 8 sprints, MVP scope |
 | [Technical Spec (F2)](docs/F2_spec.md) | Metrics, baselines, SLAs, fairness evaluation |
 | [API Reference (F6)](docs/F6_api_reference.md) | All endpoints with curl examples |
-| [Deployment Guide (F6)](docs/F6_deployment_guide.md) | Prerequisites, config, production deploy |
+| [Deployment Guide (F6)](docs/F6_deployment_guide.md) | Prerequisites, config; its production section is not validated |
 | [Operations Runbook (F6)](docs/F6_runbook.md) | Common issues, rollback, scaling |
 
 ---
@@ -194,7 +194,7 @@ This is a **portfolio project** for AI agent architecture in FinTech. It is not 
 | Area | Implemented (code + tests) | Simulated / partial | Pending |
 |---|---|---|---|
 | Agents and routing | LangGraph graph, Donna routing ([`test_graph.py`](tests/test_graph.py), [`test_donna.py`](tests/test_donna.py)) | Agent answers depend on the configured LLM; no quality benchmark | Ollama cloud-model support (decided, not verified) |
-| Tools | Real implementations behind the sandbox ([`test_tool_implementations.py`](tests/test_tool_implementations.py), [`test_tool_registry.py`](tests/test_tool_registry.py)) | Sandbox tests use a mocked Docker client ([`test_sandbox.py`](tests/test_sandbox.py)). Without a registry the tools are stubs that raise `NotImplementedError`; the production Compose does not mount a Docker socket, so real sandbox execution there is **not** supported | Live sandbox test; production wiring |
+| Tools | Real implementations behind the sandbox ([`test_tool_implementations.py`](tests/test_tool_implementations.py), [`test_tool_registry.py`](tests/test_tool_registry.py)) | Sandbox tests use a mocked Docker client ([`test_sandbox.py`](tests/test_sandbox.py)). The registry is always created, but if Docker is not healthy at startup the tools fall back to stubs that raise `NotImplementedError`; the production Compose does not mount a Docker socket, so real sandbox execution there is **not** supported | Live sandbox test; production wiring |
 | Sandbox isolation | `cap_drop=ALL`, `no-new-privileges`, network disabled by default | Docker default seccomp only (no custom profile). Red-team tools run **with network**, filtered by a URL check ([`test_security_controls.py`](tests/test_security_controls.py)) | Egress policy; custom seccomp |
 | Authentication | JWT validation ([`test_auth.py`](tests/test_auth.py)) | Dev/staging accept any login and `dev-token` as enterprise tier | User store (`/auth/token` returns 501 in production); tier/role enforcement (RBAC) |
 | Authorization and approval | HITL pause/resume in the graph | Mechanism present | Reviewed fixes for open audit findings; operational guarantee |

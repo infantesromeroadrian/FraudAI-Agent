@@ -149,7 +149,9 @@ ENVIRONMENT=production
 |  Anthropic API    |     | Sandbox Docker   |             |
 |  (Claude Sonnet)  |     | (Codigo efimero) |             |
 |  Externo          |     | Red: none        |             |
-+-------------------+     | RAM: 4GB max     |             |
++-------------------+     |  (defecto)       |             |
+                          | Red-team: con red|             |
+                          | RAM: 4GB max     |             |
                           +------------------+             |
                                                            |
                           +--------------------------------+
