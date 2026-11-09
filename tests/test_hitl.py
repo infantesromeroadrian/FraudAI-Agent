@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 from fastapi import FastAPI
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from langgraph.types import Command
 
@@ -75,6 +77,9 @@ class _ScriptedChatModel:
         return self
 
     async def ainvoke(self, messages: list[Any]) -> AIMessage:
+        return self.reply(messages)
+
+    def reply(self, messages: list[Any]) -> AIMessage:
         probe = self._probe
         system = messages[0]
         if not system.content.startswith(AGENT_PROMPTS["mike"]):
@@ -89,6 +94,24 @@ class _ScriptedChatModel:
         if not plan:
             return AIMessage(content=probe.mike_text)
         return AIMessage(content="", tool_calls=plan)
+
+
+class _CallbackChatModel(BaseChatModel):
+    """A real ``BaseChatModel`` so LangGraph emits genuine ``on_chat_model_*`` events."""
+
+    script: Any
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted-local"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> _CallbackChatModel:
+        return self
+
+    def _generate(
+        self, messages: list[Any], stop: Any = None, run_manager: Any = None, **kwargs: Any
+    ) -> ChatResult:
+        return ChatResult(generations=[ChatGeneration(message=self.script(messages))])
 
 
 @pytest.fixture()
@@ -108,9 +131,14 @@ def probe(monkeypatch: pytest.MonkeyPatch) -> _Probe:
         return state.tool_output
 
     @tool("prompt_injection_suite")
-    async def injection(target_endpoint: str) -> Any:
+    async def injection(target_endpoint: str, max_payloads: int = 5) -> Any:
         """Spy: records the execution, touches no network."""
-        state.executions.append(("prompt_injection_suite", {"target_endpoint": target_endpoint}))
+        state.executions.append(
+            (
+                "prompt_injection_suite",
+                {"target_endpoint": target_endpoint, "max_payloads": max_payloads},
+            )
+        )
         return state.tool_output
 
     @tool("search_boe")
@@ -180,7 +208,7 @@ async def test_nothing_runs_until_the_call_is_approved(probe: _Probe) -> None:
     assert probe.executions == []
     assert action["kind"] == APPROVAL_KIND
     assert action["tool"] == "adversarial_evasion"
-    assert action["arguments"] == {"target_endpoint": TARGET}
+    assert action["arguments"] == {"target_endpoint": TARGET, "attack_type": "sign_noise"}
     assert action["target"] == TARGET
     assert action["action_id"]
     assert (await graph.aget_state(config)).next == ("approve_action",)
@@ -260,7 +288,9 @@ async def test_repeated_invalid_answers_fail_closed(probe: _Probe) -> None:
 
     assert probe.executions == []
     assert await _pending(graph, config) == []
-    assert "cancelled" in final["messages"][-1].content
+    reply = final["messages"][-1].content
+    assert "refused" in reply
+    assert "by the user" not in reply  # invalid answers are not a user rejection
 
 
 async def test_each_offensive_call_needs_its_own_approval(probe: _Probe) -> None:
@@ -279,7 +309,7 @@ async def test_each_offensive_call_needs_its_own_approval(probe: _Probe) -> None
     assert [name for name, _ in probe.executions] == ["adversarial_evasion"]
     (second,) = await _pending(graph, config)
     assert second["tool"] == "prompt_injection_suite"
-    assert second["arguments"] == {"target_endpoint": OTHER_TARGET}
+    assert second["arguments"] == {"target_endpoint": OTHER_TARGET, "max_payloads": 5}
     assert second["action_id"] != first["action_id"]
 
     # The first approval cannot be reused for the second call.
@@ -361,17 +391,133 @@ async def test_unknown_tool_is_neither_asked_nor_run(probe: _Probe) -> None:
     assert final["messages"][-1].content == probe.final_text
 
 
+def _oversized_call(call_id: str) -> dict[str, Any]:
+    return _call(
+        "adversarial_evasion",
+        call_id,
+        target_endpoint=TARGET,
+        attack_type="x" * MAX_ARGUMENTS_BYTES,
+    )
+
+
 async def test_unreviewable_arguments_are_refused_not_truncated(probe: _Probe) -> None:
+    probe.plans = [[_oversized_call("c1")]]
+    graph = graph_module.build_fraud_ai_graph()
+    config = _config()
+
+    final = await graph.ainvoke(_turn(), config)
+
+    reply = final["messages"][-1].content
+    assert probe.executions == []
+    assert await _pending(graph, config) == []
+    assert "refused" in reply
+    assert "by the user" not in reply  # the user decided nothing
+
+
+async def test_user_rejection_and_policy_refusal_are_reported_separately(probe: _Probe) -> None:
+    probe.plans = [
+        [_call("adversarial_evasion", "c1", target_endpoint=TARGET), _oversized_call("c2")]
+    ]
+    graph, config, action = await _paused_graph(probe)
+
+    final = await graph.ainvoke(_answer(action["action_id"], False), config)
+
+    reply = final["messages"][-1].content
+    assert probe.executions == []
+    assert "1 rejected by the user" in reply
+    assert "1 refused before approval" in reply
+    assert probe.mike_final_calls == 0
+
+
+async def test_answer_does_not_deny_a_call_that_ran_when_another_was_refused(
+    probe: _Probe,
+) -> None:
+    probe.plans = [
+        [_call("adversarial_evasion", "c1", target_endpoint=TARGET), _oversized_call("c2")]
+    ]
+    graph, config, action = await _paused_graph(probe)
+
+    final = await graph.ainvoke(_answer(action["action_id"], True), config)
+
+    assert len(probe.executions) == 1
+    assert final["messages"][-1].content == probe.final_text  # model answer, not a canned cancel
+    (messages,) = probe.final_messages
+    outcomes = {m.tool_call_id: m.content for m in messages if isinstance(m, ToolMessage)}
+    assert 'status="success"' in outcomes["c1"]
+    assert 'status="error"' in outcomes["c2"] and "Refused" in outcomes["c2"]
+    assert "user" not in outcomes["c2"]
+
+
+async def test_model_is_told_which_call_the_user_rejected_when_another_ran(probe: _Probe) -> None:
+    probe.plans = [
+        [
+            _call("adversarial_evasion", "c1", target_endpoint=TARGET),
+            _call("prompt_injection_suite", "c2", target_endpoint=OTHER_TARGET),
+        ]
+    ]
+    graph, config, first = await _paused_graph(probe)
+    await graph.ainvoke(_answer(first["action_id"], True), config)
+    (second,) = await _pending(graph, config)
+
+    final = await graph.ainvoke(_answer(second["action_id"], False), config)
+
+    assert [name for name, _ in probe.executions] == ["adversarial_evasion"]
+    assert final["messages"][-1].content == probe.final_text
+    (messages,) = probe.final_messages
+    outcomes = {m.tool_call_id: m.content for m in messages if isinstance(m, ToolMessage)}
+    assert "Rejected by the user" in outcomes["c2"]
+    assert 'status="success"' in outcomes["c1"]
+
+
+# ---------------------------------------------------------------------------
+# W1: what is shown is what the tool receives
+# ---------------------------------------------------------------------------
+
+
+async def test_arguments_are_coerced_before_approval_and_run_exactly_as_shown(
+    probe: _Probe,
+) -> None:
     probe.plans = [
         [
             _call(
-                "adversarial_evasion",
+                "prompt_injection_suite",
                 "c1",
                 target_endpoint=TARGET,
-                attack_type="x" * MAX_ARGUMENTS_BYTES,
+                max_payloads="3",
+                undeclared="x",
             )
         ]
     ]
+    graph, config, action = await _paused_graph(probe)
+
+    assert action["arguments"] == {"target_endpoint": TARGET, "max_payloads": 3}
+    await graph.ainvoke(_answer(action["action_id"], True), config)
+
+    assert probe.executed("prompt_injection_suite") == [action["arguments"]]
+
+
+async def test_defaults_shown_at_approval_are_the_ones_executed(probe: _Probe) -> None:
+    graph, config, action = await _paused_graph(probe)  # the plan omits attack_type
+
+    assert action["arguments"]["attack_type"] == "sign_noise"
+    await graph.ainvoke(_answer(action["action_id"], True), config)
+
+    assert probe.executed("adversarial_evasion") == [action["arguments"]]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"max_payloads": 3},
+        {"target_endpoint": TARGET, "max_payloads": "many"},
+        {"target_endpoint": 7},
+    ],
+    ids=["missing-required", "uncoercible", "wrong-type"],
+)
+async def test_arguments_that_do_not_fit_the_tool_are_refused_before_asking(
+    probe: _Probe, args: dict[str, Any]
+) -> None:
+    probe.plans = [[_call("prompt_injection_suite", "c1", **args)]]
     graph = graph_module.build_fraud_ai_graph()
     config = _config()
 
@@ -379,7 +525,7 @@ async def test_unreviewable_arguments_are_refused_not_truncated(probe: _Probe) -
 
     assert probe.executions == []
     assert await _pending(graph, config) == []
-    assert "cancelled" in final["messages"][-1].content
+    assert "refused" in final["messages"][-1].content
 
 
 async def test_tool_output_reaches_the_model_only_delimited_and_never_as_a_message(
@@ -498,7 +644,7 @@ async def test_chat_shows_what_is_awaiting_approval_and_runs_nothing(
 
     action = data["pending_action"]
     assert action["tool"] == "adversarial_evasion"
-    assert action["arguments"] == {"target_endpoint": TARGET}
+    assert action["arguments"] == {"target_endpoint": TARGET, "attack_type": "sign_noise"}
     assert action["target"] == TARGET
     assert action["kind"] == APPROVAL_KIND
     assert data["agent"] == "mike"
@@ -702,3 +848,44 @@ async def test_stream_announces_the_pending_action_and_runs_nothing(
     confirm = await _confirm(client, done["session_id"], pending["action_id"], True)
     assert confirm.status_code == 200
     assert len(probe.executions) == 1
+
+
+async def test_stream_with_only_a_read_only_tool_keeps_mike_as_the_agent_and_for_continuity(
+    client: httpx.AsyncClient,
+    probe: _Probe,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Real BaseChatModel => real on_chat_model_start events carrying node names.
+    model = _CallbackChatModel(script=_ScriptedChatModel(probe).reply)
+    monkeypatch.setattr(invoker_module, "_build_llm", lambda *args, **kwargs: model)
+    monkeypatch.setattr(graph_module, "_claude_invoker", None)
+
+    async def donna_cannot_classify(message: str) -> dict[str, Any]:
+        return {"agent": None, "language": "en", "confidence": 0.0}
+
+    monkeypatch.setattr(graph_module, "classify_intent_local", donna_cannot_classify)
+    probe.plans = [[_call("search_boe", "c1", query="AI Act")], []]
+    probe.mike_text = "second turn: new answer from Mike"
+
+    first = await client.post(
+        "/api/v1/chat/stream",
+        json={"message": "check the AI Act", "agent_override": "mike"},
+        headers=_bearer(),
+    )
+
+    events = _sse_events(first.text)
+    done = events[-1]["response"]
+    assert (done["agent"], done["metadata"]["routing_agent"]) == ("mike", "mike")
+    assert [name for name, _ in probe.executions] == ["search_boe"]
+    sid = done["session_id"]
+    assert app.state.session_manager.get_session(sid).agent_history[-1] == "mike"
+
+    second = await client.post(
+        "/api/v1/chat", json={"message": "and now?", "session_id": sid}, headers=_bearer()
+    )
+
+    assert second.status_code == 200
+    assert second.json()["agent"] == "mike"
+    assert second.json()["message"] == probe.mike_text
+    assert probe.mike_plan_calls == 2  # the model really ran again

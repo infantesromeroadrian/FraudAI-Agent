@@ -31,6 +31,8 @@ from fraudai.agents.claude_invoker import ClaudeAgentInvoker
 from fraudai.agents.donna import DonnaRouter, IntentClassification
 from fraudai.agents.hitl import (
     MAX_DECISION_ATTEMPTS,
+    NO_APPROVAL_NOTE,
+    USER_REJECTION_NOTE,
     ActionProposal,
     ActionStatus,
     action_digest,
@@ -336,8 +338,8 @@ async def mike_agent_node(state: AgentState) -> dict[str, Any]:
         result = invoker.build_result(agent_name, plan_message, [], started)
         return {**_agent_update(state, result), "proposed_actions": []}
 
-    known = {str(getattr(t, "name", "")) for t in tools}
-    proposals = build_proposals(agent_name, state.get("session_id", ""), calls, known)
+    by_name = {str(getattr(t, "name", "")): t for t in tools}
+    proposals = build_proposals(agent_name, state.get("session_id", ""), calls, by_name)
     return {"proposed_actions": proposals}
 
 
@@ -382,12 +384,10 @@ async def action_approval_node(state: AgentState) -> dict[str, Any]:
     if approved:
         proposals[index] = {**action, "status": "approved"}
     else:
-        note = (
-            "Rejected by the user; not executed."
-            if approved is False
-            else "No valid approval received; not executed."
-        )
-        proposals[index] = {**action, "status": "rejected", "note": note}
+        if approved is False:
+            proposals[index] = {**action, "status": "rejected", "note": USER_REJECTION_NOTE}
+        else:
+            proposals[index] = {**action, "status": "refused", "note": NO_APPROVAL_NOTE}
     return {"proposed_actions": proposals}
 
 
@@ -428,6 +428,21 @@ async def action_executor_node(state: AgentState) -> dict[str, Any]:
 
 
 _REJECTED_PLAN_MESSAGE = "Red teaming action cancelled by user. No offensive tools were executed."
+_REFUSED_DETAIL = "(invalid, unreviewable or without a valid approval)"
+
+
+def _nothing_ran_message(proposals: list[ActionProposal]) -> str:
+    """Canned reply when no call ran; says who stopped each one, truthfully."""
+    by_user = sum(p["status"] == "rejected" for p in proposals)
+    refused = len(proposals) - by_user
+    if refused == 0:
+        return _REJECTED_PLAN_MESSAGE
+    if by_user == 0:
+        return f"No action was executed: every proposed call was refused {_REFUSED_DETAIL}."
+    return (
+        f"No action was executed: {by_user} rejected by the user, "
+        f"{refused} refused before approval {_REFUSED_DETAIL}."
+    )
 
 
 def _outcome_for_model(action: ActionProposal) -> dict[str, Any]:
@@ -448,10 +463,10 @@ async def action_finalize_node(state: AgentState) -> dict[str, Any]:
     """
     proposals = list(state.get("proposed_actions") or [])
     cleared: dict[str, Any] = {"proposed_actions": []}
-    if all(p["status"] == "rejected" for p in proposals):
+    if all(p["status"] in ("rejected", "refused") for p in proposals):
         return {
             **cleared,
-            "messages": [AIMessage(content=_REJECTED_PLAN_MESSAGE)],
+            "messages": [AIMessage(content=_nothing_ran_message(proposals))],
             "tool_results": [],
             "escalation_request": None,
         }

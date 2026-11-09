@@ -226,6 +226,8 @@ def _build_metadata(state: dict[str, Any], latency_ms: int) -> ResponseMetadata:
 # Human approval (R2): pending actions and per-session serialisation
 # ---------------------------------------------------------------------------
 
+_SPECIALIST_NODES = frozenset({"harvey", "louis", "jessica", "mike", "rachel"})
+
 PENDING_ACTION_MESSAGE = (
     "Approval required before an offensive tool runs. "
     "Review the pending action and confirm or reject it."
@@ -515,11 +517,9 @@ async def chat_stream(
                     # Detect which agent's model is running
                     meta = event.get("metadata", {})
                     langgraph_node = meta.get("langgraph_node", "")
-                    if langgraph_node and langgraph_node not in (
-                        "donna",
-                        "responder",
-                        "approve_action",
-                    ):
+                    # Only specialist nodes are agents: helper nodes such as
+                    # ``finalize_actions`` also call the model but are not identities.
+                    if langgraph_node in _SPECIALIST_NODES:
                         agent_name = langgraph_node
 
                 elif event_type == "on_chain_end":

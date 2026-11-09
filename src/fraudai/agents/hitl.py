@@ -20,7 +20,12 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from typing import Any, Final, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict
+
+from pydantic import BaseModel, ValidationError
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 APPROVAL_KIND: Final = "offensive_tool_approval"
 
@@ -41,7 +46,12 @@ MAX_DECISION_ATTEMPTS: Final = 3
 
 _TARGET_KEYS: Final = ("target_endpoint", "target", "endpoint", "url")
 
-ActionStatus = Literal["awaiting_approval", "approved", "rejected", "executed", "failed"]
+# ``rejected`` is the user's decision; ``refused`` is ours (policy, validation or
+# no valid answer) and must never be reported as the user's choice.
+ActionStatus = Literal["awaiting_approval", "approved", "rejected", "refused", "executed", "failed"]
+
+USER_REJECTION_NOTE: Final = "Rejected by the user; not executed."
+NO_APPROVAL_NOTE: Final = "Refused: no valid approval received; not executed."
 
 OFFENSIVE_WARNING: Final = (
     "This action will run an offensive security tool against the target shown. "
@@ -105,6 +115,26 @@ def action_digest(session_id: str, agent: str, tool: str, arguments: dict[str, A
     return hashlib.sha256(envelope.encode()).hexdigest()
 
 
+def normalize_arguments(tool: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Arguments as the tool will really receive them: validated, coerced, defaults filled.
+
+    The reviewer sees and approves this form, and this form is what runs, so a
+    default or coercion applied later cannot differ from what was approved.
+    Tools without a pydantic schema are taken as given.
+
+    Raises:
+        ValueError: the arguments do not fit the tool's schema.
+    """
+    schema = getattr(tool, "args_schema", None)
+    if not (isinstance(schema, type) and issubclass(schema, BaseModel)):
+        return arguments
+    try:
+        return schema.model_validate(arguments).model_dump(mode="json")
+    except ValidationError as exc:
+        msg = "arguments do not match the tool schema"
+        raise ValueError(msg) from exc
+
+
 def _call_field(call: Any, field: str, default: Any) -> Any:
     if isinstance(call, dict):
         return call.get(field, default)
@@ -115,12 +145,14 @@ def build_proposals(
     agent: str,
     session_id: str,
     tool_calls: list[Any],
-    known_tools: set[str],
+    tools_by_name: Mapping[str, Any],
 ) -> list[ActionProposal]:
     """Freeze the model's tool calls into proposals with server-issued ids.
 
-    Calls that cannot run (unknown tool, unreviewable arguments, over the
-    per-plan cap) are given a terminal status here, so they never reach an
+    Arguments are normalised against the tool's schema first, so the digest,
+    the pending action and the execution all use the same effective values.
+    Calls that cannot run (unknown tool, arguments that do not fit, unreviewable
+    size, over the per-plan cap) get a terminal status here and never reach an
     approval prompt or an executor.
     """
     proposals: list[ActionProposal] = []
@@ -128,7 +160,7 @@ def build_proposals(
     for index, call in enumerate(tool_calls):
         tool = str(_call_field(call, "name", ""))
         raw_args = _call_field(call, "args", {})
-        arguments = raw_args if isinstance(raw_args, dict) else {}
+        arguments: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
         call_id = str(_call_field(call, "id", "") or f"call-{index}")
         if call_id in seen_call_ids:
             call_id = f"{call_id}-{index}"
@@ -139,16 +171,24 @@ def build_proposals(
         note: str | None = None
         digest = ""
         if index >= MAX_CALLS_PER_PLAN:
-            status, note = "rejected", "Too many tool calls in one plan; not executed."
-        elif tool not in known_tools:
+            status = "refused"
+            note = f"Refused: more than {MAX_CALLS_PER_PLAN} tool calls in one plan; not executed."
+        elif tool not in tools_by_name:
             status, note = "failed", f"Tool '{tool}' is not available to this agent."
         elif not isinstance(raw_args, dict):
-            status, note = "rejected", "Tool arguments were not an object; not executed."
+            status, note = "refused", "Refused: tool arguments were not an object; not executed."
         else:
             try:
-                digest = action_digest(session_id, agent, tool, arguments)
+                arguments = normalize_arguments(tools_by_name[tool], arguments)
             except ValueError:
-                status, note = "rejected", "Arguments cannot be reviewed; not executed."
+                status = "refused"
+                note = "Refused: arguments do not match the tool's schema; not executed."
+            else:
+                try:
+                    digest = action_digest(session_id, agent, tool, arguments)
+                except ValueError:
+                    status = "refused"
+                    note = "Refused: arguments cannot be reviewed (too large); not executed."
 
         proposals.append(
             ActionProposal(

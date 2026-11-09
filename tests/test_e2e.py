@@ -343,7 +343,8 @@ class TestE2ERedTeamingMikeRouting:
         assert "No response generated" not in data["message"]
         action = data["pending_action"]
         assert (action["tool"], action["target"]) == ("adversarial_evasion", target)
-        assert action["arguments"] == {"target_endpoint": target}
+        # The effective arguments, default included, are what the user approves.
+        assert action["arguments"] == {"target_endpoint": target, "attack_type": "sign_noise"}
         assert data["tool_results"] == []
         invoker.respond_with_tool_results.assert_not_awaited()
 
