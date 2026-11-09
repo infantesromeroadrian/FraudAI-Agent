@@ -19,7 +19,6 @@ build/
 .venv/
 venv/
 env/
-.python-version
 
 # IDE
 .vscode/
@@ -78,7 +77,6 @@ htmlcov/
 
 # ruff
 .ruff_cache/
-uv.lock
 
 # Frontend
 frontend/.next/

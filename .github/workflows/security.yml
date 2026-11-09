@@ -3,12 +3,17 @@ name: Security
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
     - cron: "0 6 * * 1" # Weekly Monday 6am UTC
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  UV_FROZEN: "1"
 
 jobs:
   dependency-audit:
@@ -17,15 +22,34 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
-          python-version: "3.11"
-      - run: uv pip install -e ".[dev]"
-      - run: uv pip install pip-audit
-      - run: uv run pip-audit
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # Audit exactly what uv.lock pins (all extras), not a fresh resolution.
+      - run: uv export --frozen --all-extras --no-emit-project --no-hashes -o requirements-audit.txt
+      - run: uvx pip-audit -r requirements-audit.txt --no-deps --disable-pip
+
+  frontend-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+      - run: cd frontend && pnpm install --frozen-lockfile
+      # Production dependencies (what ships); fails on HIGH or CRITICAL.
+      - run: cd frontend && pnpm audit --prod --audit-level high
+      # Full tree (incl. dev tooling); same threshold.
+      - run: cd frontend && pnpm audit --audit-level high
 
   secrets-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb # v3.99.8
         with:
           extra_args: --only-verified
