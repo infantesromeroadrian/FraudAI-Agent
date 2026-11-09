@@ -109,3 +109,32 @@ def test_startup_error_is_not_swallowed_by_the_degraded_mode_handlers() -> None:
         TestClient(create_app()),
     ):
         pass
+
+
+async def test_degraded_rag_keeps_the_explicit_sandbox_provider_not_stubs() -> None:
+    """CX4/B1: an embedder that cannot load must not send the graph back to stub tools."""
+    from fraudai.agents import graph as graph_module
+
+    previous = graph_module._tool_registry
+    cfg = _settings(sandbox_mode="disabled", environment="production")
+    try:
+        with (
+            patch("fraudai.api.app.settings", cfg),
+            patch(
+                "fraudai.ingestion.embeddings.EmbeddingGenerator",
+                MagicMock(side_effect=OSError("read-only filesystem: cannot download model")),
+            ),
+            TestClient(create_app()) as client,
+        ):
+            registry = client.app.state.tool_registry  # type: ignore[attr-defined]
+            assert registry is not None, "graph would fall back to AGENT_TOOLS stubs"
+            assert graph_module._tool_registry is registry
+            tools = {t.name: t for t in registry.get_tools_for_agent("mike")}
+            result = await tools["adversarial_evasion"].ainvoke(
+                {"target_endpoint": "https://model.example/p"}
+            )
+            assert result["status"] == "disabled"
+            assert result["error_code"] == "sandbox_disabled"
+            assert "unavailable" not in str(result.get("message", ""))
+    finally:
+        graph_module._tool_registry = previous

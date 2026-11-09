@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -31,6 +31,17 @@ from fraudai.api.session_manager import SessionManager
 from fraudai.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class _UnavailableRetriever:
+    """Stand-in used when RAG failed to initialise: ``search_boe`` errors explicitly."""
+
+    async def retrieve(self, *_: Any, **__: Any) -> list[Any]:
+        msg = "search_boe is unavailable: the RAG components failed to initialise"
+        raise RuntimeError(msg)
+
+    def format_citations(self, *_: Any, **__: Any) -> list[dict[str, Any]]:
+        return []
 
 
 class SandboxStartupError(RuntimeError):
@@ -133,32 +144,35 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     from fraudai.ingestion.embeddings import EmbeddingGenerator
     from fraudai.rag.retriever import LegalRetriever
 
+    embedder: EmbeddingGenerator | None = None
+    retriever: LegalRetriever | None = None
     try:
         embedder = EmbeddingGenerator(
             device="cpu"
         )  # CPU for API queries; GPU reserved for ingestion
         retriever = LegalRetriever(store=store, embedder=embedder)
-
-        tool_registry = ToolRegistry(
-            retriever=retriever,
-            sandbox=sandbox,
-            tool_impls=tool_impls,
-        )
-        logger.info(
-            "ToolRegistry initialized (retriever=LegalRetriever, sandbox=%s, tool_impls=%s)",
-            "enabled" if sandbox is not None else "disabled",
-            "enabled" if sandbox is not None else "explicit-errors",
-        )
     except Exception:
-        logger.exception("ToolRegistry initialization failed — tools will use stubs")
-        tool_registry = None
-        retriever = None
+        logger.exception("RAG initialization failed -- search_boe will report it explicitly")
+        embedder = None
+
+    # The registry is built even when RAG is down: dropping it would send the graph
+    # back to AGENT_TOOLS stubs and lose the explicit sandbox provider (F3.6).
+    tool_registry = ToolRegistry(
+        retriever=retriever or cast("LegalRetriever", _UnavailableRetriever()),
+        sandbox=sandbox,
+        tool_impls=tool_impls,
+    )
+    logger.info(
+        "ToolRegistry initialized (retriever=%s, sandbox=%s, tool_impls=%s)",
+        "LegalRetriever" if retriever is not None else "unavailable",
+        "enabled" if sandbox is not None else "disabled",
+        "enabled" if sandbox is not None else "explicit-errors",
+    )
 
     # Inject ToolRegistry into graph BEFORE compilation
-    if tool_registry is not None:
-        from fraudai.agents.graph import set_tool_registry
+    from fraudai.agents.graph import set_tool_registry
 
-        set_tool_registry(tool_registry)
+    set_tool_registry(tool_registry)
 
     # LangGraph compiled graph
     graph = build_fraud_ai_graph()
@@ -203,7 +217,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.feedback_store = feedback_store
     app.state.tool_registry = tool_registry
     app.state.retriever = retriever
-    app.state.embedder = embedder if retriever is not None else None
+    app.state.embedder = embedder
     app.state.db = db
 
     yield

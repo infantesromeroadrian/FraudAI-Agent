@@ -168,7 +168,23 @@ jobs:
           cache-dependency-glob: uv.lock
       - run: uv sync --frozen --extra dev
       - run: docker build -t "$FRAUDAI_SANDBOX_IMAGE" src/fraudai/tools/sandbox_image/
+      # Evidence is taken before AND after the battery (the "after" step also runs
+      # when the battery fails), so a run shows which daemon and image it exercised
+      # and whether anything labelled as sandbox-owned was left behind. Read-only.
+      - name: Record Docker and image (before)
+        run: |
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}} os={{.Server.Os}}/{{.Server.Arch}}'
+          docker image inspect "$FRAUDAI_SANDBOX_IMAGE" --format 'image={{.Id}} created={{.Created}} arch={{.Architecture}}'
+          echo "sandbox-labelled containers:"; docker ps -a --filter label=fraudai.sandbox=1 --format '{{.Names}}'
+          echo "sandbox-labelled networks:"; docker network ls --filter label=fraudai.sandbox=1 --format '{{.Name}}'
       - run: uv run pytest tests/integration -m docker -v
+      - name: Record Docker and image (after)
+        if: always()
+        run: |
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}} os={{.Server.Os}}/{{.Server.Arch}}'
+          docker image inspect "$FRAUDAI_SANDBOX_IMAGE" --format 'image={{.Id}} created={{.Created}} arch={{.Architecture}}'
+          echo "sandbox-labelled containers:"; docker ps -a --filter label=fraudai.sandbox=1 --format '{{.Names}}'
+          echo "sandbox-labelled networks:"; docker network ls --filter label=fraudai.sandbox=1 --format '{{.Name}}'
 
   frontend:
     runs-on: ubuntu-latest

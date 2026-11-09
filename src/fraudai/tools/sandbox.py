@@ -20,6 +20,7 @@ the host address from the network.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import stat
@@ -29,7 +30,7 @@ import uuid
 import weakref
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import docker
 import docker.errors
@@ -40,6 +41,8 @@ from fraudai.core.metrics import SANDBOX_DURATION, SANDBOX_EXECUTIONS
 from fraudai.tools.egress import FORWARDER_SOURCE, EgressTarget, alias_for
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from docker.models.containers import Container
     from docker.models.networks import Network
 
@@ -64,6 +67,10 @@ class SandboxResult(BaseModel):
     output_files: dict[str, bytes] = {}
     # Output entries that were refused (symlink, special file, over a cap).
     rejected_outputs: list[str] = []
+    # Total refusals (``rejected_outputs`` stores at most OutputCaps.max_rejected_names)
+    # and whether the bounded walk stopped early; both are explicit, never silent.
+    rejected_total: int = 0
+    outputs_truncated: bool = False
     duration_seconds: float
     timed_out: bool = False
 
@@ -72,59 +79,157 @@ class SandboxResult(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class OutputCaps:
-    """Limits applied when reading ``/workspace/output`` back to the host."""
+    """Limits applied when reading ``/workspace/output`` back to the host.
+
+    Besides bytes and file count, the walk itself is bounded: the sandbox
+    controls how many entries exist, so the host never lists, sorts or
+    remembers more than ``max_entries`` / ``max_rejected_names`` of them.
+    """
 
     max_total_bytes: int = 8 * _MIB
     max_file_bytes: int = 4 * _MIB
     max_files: int = 64
+    max_entries: int = 1024  # entries visited across the whole tree
+    max_depth: int = 8
+    max_rejected_names: int = 64  # names reported back; the rest are only counted
 
 
-def read_output_tree(root: Path, caps: OutputCaps) -> tuple[dict[str, bytes], list[str]]:
+class OutputCollection(NamedTuple):
+    """What came back from the output directory, with explicit truncation."""
+
+    files: dict[str, bytes]
+    rejected: list[str]  # sorted, at most ``max_rejected_names`` entries
+    rejected_total: int  # every refusal seen, including names not stored
+    truncated: bool  # the walk stopped at the entry/depth budget
+
+
+class _Walk:
+    """Mutable bookkeeping for one bounded, descriptor-relative tree walk."""
+
+    def __init__(self, caps: OutputCaps) -> None:
+        self.caps = caps
+        self.files: dict[str, bytes] = {}
+        self.rejected: list[str] = []
+        self.rejected_total = 0
+        self.total_bytes = 0
+        self.visited = 0
+        self.truncated = False
+
+    def reject(self, relative: str) -> None:
+        self.rejected_total += 1
+        if len(self.rejected) < self.caps.max_rejected_names:
+            self.rejected.append(relative)
+
+    def entries_left(self) -> int:
+        return self.caps.max_entries - self.visited
+
+
+def read_output_tree(root: Path, caps: OutputCaps) -> OutputCollection:
     """Read regular files below *root* without ever following a symlink.
 
-    The sandboxed code controls this tree, so every entry is untrusted:
-    symlinks (to files or directories), devices, FIFOs and anything beyond the
-    caps are refused and reported by name instead of being read.
-
-    Returns:
-        ``(files, rejected)`` where ``files`` maps POSIX relative paths to bytes.
+    The sandboxed code controls this tree and may still be altering it, so
+    every entry is untrusted. The walk is descriptor-relative: *root* is opened
+    once, each directory is opened with ``O_NOFOLLOW`` relative to its parent
+    descriptor and listed through that descriptor, so a path component swapped
+    for a symlink after it was inspected is refused instead of followed. Symlinks,
+    devices, FIFOs and anything beyond the caps are reported (bounded) rather
+    than read. ``result.json`` is looked up first so junk entries cannot starve
+    the one file the tools depend on.
     """
-    files: dict[str, bytes] = {}
-    rejected: list[str] = []
-    total = 0
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        with os.scandir(directory) as entries:
-            for entry in sorted(entries, key=lambda item: item.name):
-                relative = str(PurePosixPath(*Path(entry.path).relative_to(root).parts))
-                info = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    pending.append(Path(entry.path))
-                    continue
-                if not stat.S_ISREG(info.st_mode):
-                    rejected.append(relative)
-                    continue
-                if (
-                    len(files) >= caps.max_files
-                    or info.st_size > caps.max_file_bytes
-                    or total + info.st_size > caps.max_total_bytes
-                ):
-                    rejected.append(relative)
-                    continue
-                content = _read_regular_file(entry.path, caps.max_file_bytes)
-                if content is None:
-                    rejected.append(relative)
-                    continue
-                total += len(content)
-                files[relative] = content
-    return files, sorted(rejected)
-
-
-def _read_regular_file(path: str, limit: int) -> bytes | None:
-    """Open with ``O_NOFOLLOW`` (guards the stat/open race) and re-check the type."""
+    walk = _Walk(caps)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        _take_file(walk, root_fd, "result.json", "result.json")
+        _walk_directory(walk, root_fd, "", depth=0)
+    finally:
+        os.close(root_fd)
+    return OutputCollection(
+        files=dict(sorted(walk.files.items())),
+        rejected=sorted(walk.rejected),
+        rejected_total=walk.rejected_total,
+        truncated=walk.truncated,
+    )
+
+
+def _walk_directory(walk: _Walk, dir_fd: int, prefix: str, depth: int) -> None:
+    budget = walk.entries_left()
+    if budget <= 0:
+        walk.truncated = True
+        return
+    with os.scandir(dir_fd) as entries:
+        # islice: never materialise more than the remaining budget of a huge directory
+        names = sorted(entry.name for entry in itertools.islice(entries, budget))
+        if next(entries, None) is not None:
+            walk.truncated = True
+    walk.visited += len(names)
+    for name in names:
+        relative = f"{prefix}{name}"
+        if relative == "result.json" and "result.json" in walk.files:
+            continue  # already taken first
+        try:
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            walk.reject(relative)
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            if depth + 1 >= walk.caps.max_depth:
+                walk.truncated = True
+                walk.reject(relative)
+                continue
+            try:
+                child_fd = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+                )
+            except OSError:  # replaced by a symlink (ELOOP) or removed since the stat
+                walk.reject(relative)
+                continue
+            try:
+                _walk_directory(walk, child_fd, f"{relative}/", depth + 1)
+            finally:
+                os.close(child_fd)
+            continue
+        _take_file(walk, dir_fd, name, relative, info)
+
+
+def _take_file(
+    walk: _Walk,
+    dir_fd: int,
+    name: str,
+    relative: str,
+    info: os.stat_result | None = None,
+) -> None:
+    """Read one entry of ``dir_fd`` if it is a regular file within the caps."""
+    if relative in walk.files:
+        return
+    if info is None:
+        try:
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return  # absent: nothing to report for the optional priority lookup
+        walk.visited += 1
+    caps = walk.caps
+    if not stat.S_ISREG(info.st_mode):
+        walk.reject(relative)
+        return
+    if (
+        len(walk.files) >= caps.max_files
+        or info.st_size > caps.max_file_bytes
+        or walk.total_bytes + info.st_size > caps.max_total_bytes
+    ):
+        walk.reject(relative)
+        return
+    content = _read_regular_file(dir_fd, name, caps.max_file_bytes)
+    if content is None:
+        walk.reject(relative)
+        return
+    walk.total_bytes += len(content)
+    walk.files[relative] = content
+
+
+def _read_regular_file(dir_fd: int, name: str, limit: int) -> bytes | None:
+    """Open relative to the directory with ``O_NOFOLLOW`` and re-check the type."""
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     except OSError:
         return None
     try:
@@ -169,6 +274,24 @@ class _RunResources:
     container: Container | None = None
     proxy: Container | None = None
     network: Network | None = None
+    container_gone: bool = False  # removed (and verified) before the normal cleanup
+
+
+async def _wait_done(task: asyncio.Future[Any]) -> bool:
+    """Wait for *task* to finish even if the caller is cancelled meanwhile.
+
+    ``asyncio.to_thread`` cannot stop the thread when its await is cancelled, so
+    a Docker create may complete after the caller gave up. Callers that must not
+    orphan what it creates wait here, collect the result, and re-raise the
+    cancellation afterwards. Returns whether a cancellation was absorbed.
+    """
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            cancelled = True
+    return cancelled
 
 
 class SandboxEngine:
@@ -320,21 +443,64 @@ class SandboxEngine:
         if os.getuid() == 0:
             output.chmod(0o777)
 
+    @staticmethod
+    async def _create_tracked(
+        resources: _RunResources, slot: str, factory: Callable[..., Any], /, **kwargs: Any
+    ) -> Any:
+        """Run a Docker create so that its result is registered even if we are cancelled.
+
+        The resource is stored in ``resources`` before the cancellation (if any)
+        propagates, so the ``finally`` cleanup removes it before the concurrency
+        gate opens again.
+        """
+        task = asyncio.ensure_future(asyncio.to_thread(factory, **kwargs))
+        cancelled = await _wait_done(task)
+        if not task.cancelled() and task.exception() is None:
+            setattr(resources, slot, task.result())
+        if cancelled:
+            raise asyncio.CancelledError
+        return task.result()
+
+    @staticmethod
+    def _require_ipv4_only(network: Network) -> None:
+        """Fail closed unless the network that actually exists carries no IPv6.
+
+        ``inhibit_ipv4`` removes the host's IPv4 address from the bridge but says
+        nothing about IPv6, and daemon defaults (``default-network-opts``) can turn
+        it on. The SDK omits ``enable_ipv6=False`` from the request, so the
+        inspected state is the only evidence: anything but an explicit
+        ``EnableIPv6 == False`` (or any IPv6 subnet) aborts the run.
+        """
+        attrs = network.attrs or {}
+        configs = (attrs.get("IPAM") or {}).get("Config") or []
+        has_ipv6_subnet = any(":" in str(config.get("Subnet", "")) for config in configs)
+        if attrs.get("EnableIPv6") is not False or has_ipv6_subnet:
+            msg = "Sandbox egress network may carry IPv6 (enabled or unknown); refusing to run"
+            raise SandboxError(msg)
+
     async def _create_egress(
         self, target: EgressTarget, run_id: str, resources: _RunResources
     ) -> Network:
         """Create the sandbox-only network and the forwarder pinned to ``target``."""
         alias = alias_for(target)
-        network: Network = await asyncio.to_thread(
+        network: Network = await self._create_tracked(
+            resources,
+            "network",
             self._client.networks.create,
             name=f"fraudai-sbx-{run_id}",
             driver="bridge",
             internal=True,
-            options={"com.docker.network.bridge.inhibit_ipv4": "true"},
+            options={
+                "com.docker.network.bridge.inhibit_ipv4": "true",
+                "com.docker.network.enable_ipv6": "false",
+            },
             labels={_RESOURCE_LABEL: "1", f"{_RESOURCE_LABEL}.run": run_id},
         )
-        resources.network = network
-        proxy: Container = await asyncio.to_thread(
+        await asyncio.to_thread(network.reload)
+        self._require_ipv4_only(network)
+        proxy: Container = await self._create_tracked(
+            resources,
+            "proxy",
             self._client.containers.create,
             image=self._image,
             command=["python", "-c", FORWARDER_SOURCE, target.address, str(target.port)],
@@ -349,7 +515,6 @@ class SandboxEngine:
             user=self._container_user(),
             **self._hardening(run_id, "egress-proxy"),
         )
-        resources.proxy = proxy
         await asyncio.to_thread(network.connect, proxy, aliases=[alias])
         await asyncio.to_thread(proxy.start)
         await self._wait_for_proxy(proxy)
@@ -382,6 +547,8 @@ class SandboxEngine:
         """
         if egress is not None:
             alias_for(egress)  # refuse unreachable-by-design targets before any effect
+        # The configured timeout is a ceiling: callers may ask for less, never more.
+        timeout = min(timeout, self._timeout)
         async with _concurrency_gate(self._max_concurrent):
             return await self._run_gated(command, input_files, timeout, egress)
 
@@ -404,12 +571,17 @@ class SandboxEngine:
 
             if egress is not None:
                 network = await self._create_egress(egress, run_id, resources)
-                network_args: dict[str, Any] = {"network": network.name}
+                # The embedded resolver answers the forwarder's alias itself but forwards
+                # every other name to whatever upstream is reachable. Pin that upstream to
+                # an inert address so name resolution never depends on the daemon's DNS.
+                network_args: dict[str, Any] = {"network": network.name, "dns": ["127.0.0.1"]}
             else:
                 network_args = {"network_mode": "none"}
 
             max_file = self._output_caps.max_file_bytes
-            resources.container = container = await asyncio.to_thread(
+            container = await self._create_tracked(
+                resources,
+                "container",
                 self._client.containers.create,
                 image=self._image,
                 command=command,
@@ -472,8 +644,9 @@ class SandboxEngine:
                     timeout=timeout,
                 )
                 exit_code: int = wait_result.get("StatusCode", -1)
+                writer_state = "stopped"
             except Exception:
-                # Timeout or unexpected error -- stop the container
+                # Timeout or unexpected error: the writer may still be alive.
                 timed_out = True
                 exit_code = -1
                 logger.warning(
@@ -481,27 +654,29 @@ class SandboxEngine:
                     container.short_id,
                     timeout,
                 )
-                try:
-                    await asyncio.to_thread(container.stop, timeout=5)
-                except Exception:
-                    logger.debug(
-                        "Failed to stop container %s gracefully, will force-remove",
-                        container.short_id,
-                    )
+                writer_state = await self._ensure_stopped(container, resources)
 
             duration = time.monotonic() - start_time
 
-            stdout_bytes = await self._read_logs(container, stdout=True)
-            stderr_bytes = await self._read_logs(container, stdout=False)
+            if writer_state == "unconfirmed":
+                # Never read outputs a live sandbox could still be rewriting.
+                msg = "Sandbox container could not be confirmed stopped; outputs were discarded"
+                raise SandboxError(msg)
 
-            collected_files, rejected = await asyncio.to_thread(
-                read_output_tree, output_host, self._output_caps
-            )
-            if rejected:
+            if writer_state == "removed":
+                stdout_bytes = stderr_bytes = b""  # logs left with the container
+            else:
+                stdout_bytes = await self._read_logs(container, stdout=True)
+                stderr_bytes = await self._read_logs(container, stdout=False)
+
+            collection = await asyncio.to_thread(read_output_tree, output_host, self._output_caps)
+            collected_files, rejected = collection[0], collection[1]
+            if collection[2] or collection[3]:
                 logger.warning(
-                    "Sandbox container %s: %d output entrie(s) refused",
+                    "Sandbox container %s: %d output entrie(s) refused (truncated=%s)",
                     container.short_id,
-                    len(rejected),
+                    collection[2],
+                    collection[3],
                 )
 
             logger.info(
@@ -528,16 +703,59 @@ class SandboxEngine:
                 stderr=stderr_bytes.decode("utf-8", errors="replace"),
                 output_files=collected_files,
                 rejected_outputs=rejected,
+                rejected_total=collection[2],
+                outputs_truncated=collection[3],
                 duration_seconds=round(duration, 3),
                 timed_out=timed_out,
             )
 
         finally:
-            await self._cleanup(resources)
+            # Cleanup must finish even if this task is being cancelled, and it
+            # finishes before the concurrency gate is released by our caller.
+            cancelled = await _wait_done(asyncio.ensure_future(self._cleanup(resources)))
             try:
                 tmpdir_obj.cleanup()
             except Exception:
                 logger.debug("Tmpdir cleanup failed for %s", tmpdir)
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _container_is_stopped(self, container: Container) -> bool:
+        """True when Docker reports the container exited, dead or already removed."""
+        try:
+            await asyncio.to_thread(container.reload)
+        except docker.errors.NotFound:
+            return True
+        except Exception:
+            logger.exception("Could not inspect sandbox container %s", container.short_id)
+            return False
+        return bool(container.status in ("exited", "dead"))
+
+    async def _ensure_stopped(self, container: Container, resources: _RunResources) -> str:
+        """Make sure the sandbox can no longer write; return how that was established.
+
+        Graceful stop, then kill, then forced removal; each step is verified with
+        an inspect. ``"stopped"``: exited; ``"removed"``: had to be force-removed
+        and is gone; ``"unconfirmed"``: still possibly alive (outputs must not be read).
+        """
+        for step, action in (
+            ("stop", lambda: container.stop(timeout=5)),
+            ("kill", container.kill),
+        ):
+            try:
+                await asyncio.to_thread(action)
+            except Exception:
+                logger.warning("Sandbox container %s: %s failed", container.short_id, step)
+            if await self._container_is_stopped(container):
+                return "stopped"
+        try:
+            await asyncio.to_thread(container.remove, force=True)
+        except Exception:
+            logger.exception("Forced removal of sandbox container %s failed", container.short_id)
+        if await self._container_is_stopped(container):
+            resources.container_gone = True
+            return "removed"
+        return "unconfirmed"
 
     async def _read_logs(self, container: Container, *, stdout: bool) -> bytes:
         data: bytes = await asyncio.to_thread(container.logs, stdout=stdout, stderr=not stdout)
@@ -547,11 +765,13 @@ class SandboxEngine:
     async def _cleanup(resources: _RunResources) -> None:
         """Remove only the resources this run created, sandbox first."""
         for victim in (resources.container, resources.proxy):
-            if victim is None:
+            if victim is None or (victim is resources.container and resources.container_gone):
                 continue
             try:
                 await asyncio.to_thread(victim.remove, force=True)
                 logger.debug("Sandbox container %s removed", victim.short_id)
+            except docker.errors.NotFound:
+                logger.debug("Sandbox container %s was already gone", victim.short_id)
             except Exception:
                 logger.exception("Failed to remove sandbox container %s", victim.short_id)
         if resources.network is not None:

@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     # return an explicit error (the Compose production mode, which has no docker.sock).
     sandbox_mode: Literal["docker", "disabled"] = "docker"
     sandbox_image: str = "fraudai-sandbox:latest"
-    sandbox_timeout_seconds: int = 300
+    sandbox_timeout_seconds: int = 300  # ceiling: tools may ask for less, never more
     sandbox_mem_limit: str = "2g"
     sandbox_cpu_count: float = 2.0
     sandbox_pids_limit: int = 128
