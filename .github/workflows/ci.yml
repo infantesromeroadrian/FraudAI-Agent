@@ -101,8 +101,9 @@ jobs:
       # Trivy: vulnerability scan only (`scanners: vuln` -> TRIVY_SCANNERS). Trivy's default
       # also runs the secret scanner, which flags documentation examples such as
       # `{"type": "service_account"}` inside the anthropic SDK docstrings as CRITICAL
-      # "gcp-service-account" (false positives). Secret scanning stays covered by the
-      # TruffleHog job in security.yml.
+      # "gcp-service-account" (false positives). Image layers are therefore NOT scanned
+      # for secrets; the TruffleHog job in security.yml covers verified secrets in the
+      # repository/history only, a different scope.
       # Trivy: reports are always produced (artifact), then the gate fails on
       # HIGH/CRITICAL findings that already have a fix available.
       - name: Trivy report (API image)
