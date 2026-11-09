@@ -294,18 +294,19 @@ def graph_analysis(data_path: str) -> dict[str, Any]:
 @tool
 def adversarial_evasion(
     target_endpoint: str,
-    attack_type: str = "fgsm",
+    attack_type: str = "sign_noise",
 ) -> dict[str, Any]:
-    """Run adversarial evasion attacks against a fraud detection model.
+    """Probe a model endpoint's robustness to random input perturbations.
 
-    Generates adversarial examples designed to evade the target model's
-    fraud detection.  Measures evasion success rate and confidence
-    degradation.
+    Black-box check: adds random noise to sample inputs and measures how
+    often the prediction changes. It uses no gradients, so it is not an
+    implementation of FGSM, PGD, C&W or DeepFool.
 
     Args:
-        target_endpoint: URL of the model API endpoint to test.
-        attack_type: Attack algorithm — "fgsm", "pgd", "cw", or
-            "deepfool".
+        target_endpoint: Public http(s) URL of the model API endpoint.
+            Private, loopback and link-local addresses are rejected.
+        attack_type: Perturbation — "sign_noise", "iterative_sign_noise",
+            "gaussian_noise_small" or "gaussian_noise".
 
     Returns:
         Dict with keys: evasion_rate (float), original_predictions (list),

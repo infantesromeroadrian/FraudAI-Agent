@@ -85,6 +85,14 @@ def mock_sandbox_networked() -> MagicMock:
     return sandbox
 
 
+@pytest.fixture(autouse=True)
+def _public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve every test hostname to a public address (no real DNS in tests)."""
+    monkeypatch.setattr(
+        ToolImplementations, "_resolve_host", staticmethod(lambda _host: ["93.184.216.34"])
+    )
+
+
 @pytest.fixture()
 def tool_impls(mock_sandbox: MagicMock, mock_sandbox_networked: MagicMock) -> ToolImplementations:
     """Return a ToolImplementations with mocked sandboxes."""
@@ -538,7 +546,7 @@ class TestAdversarialEvasion:
 
         result = await tool_impls.adversarial_evasion(
             target_endpoint="http://model.local/predict",
-            attack_type="fgsm",
+            attack_type="sign_noise",
         )
 
         assert result["status"] == "success"
@@ -556,11 +564,11 @@ class TestAdversarialEvasion:
 
         await tool_impls.adversarial_evasion(
             target_endpoint="http://test/predict",
-            attack_type="pgd",
+            attack_type="iterative_sign_noise",
         )
 
         code = mock_sandbox_networked.execute_python.call_args.kwargs["code"]
-        assert "pgd" in code
+        assert "iterative_sign_noise" in code
 
     async def test_endpoint_in_code(
         self,

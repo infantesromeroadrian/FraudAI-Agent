@@ -15,12 +15,16 @@ Architecture note:
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import logging
+import socket
 import tempfile
 import textwrap
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fraudai.tools.sandbox import SandboxEngine, SandboxResult
 
@@ -130,7 +134,10 @@ class ToolImplementations:
         to prevent path traversal attacks from LLM tool calls.
         """
         path = Path(data_path).resolve()
-        if not any(str(path).startswith(d) for d in self.ALLOWED_INPUT_DIRS):
+        # Compare resolved paths, not string prefixes: "/tmpx/secret" starts
+        # with "/tmp", and on macOS the temp dir is a symlink (/var -> /private/var).
+        allowed = [Path(d).resolve() for d in self.ALLOWED_INPUT_DIRS]
+        if not any(path.is_relative_to(base) for base in allowed):
             msg = f"Access denied: path '{data_path}' is outside allowed directories"
             raise PermissionError(msg)
         if not path.exists():
@@ -921,53 +928,79 @@ class ToolImplementations:
     # Mike Ross -- AI Red Teaming (uses networked sandbox)
     # ===================================================================
 
-    # Internal/private networks blocked for red teaming tools (SSRF prevention)
-    _BLOCKED_TARGETS = (
-        "localhost",
-        "127.0.0.1",
-        "0.0.0.0",
-        "10.",
-        "172.16.",
-        "172.17.",
-        "172.18.",
-        "172.19.",
-        "172.20.",
-        "172.21.",
-        "172.22.",
-        "172.23.",
-        "172.24.",
-        "172.25.",
-        "172.26.",
-        "172.27.",
-        "172.28.",
-        "172.29.",
-        "172.30.",
-        "172.31.",
-        "192.168.",
-        "169.254.",
-        "[::1]",
-        "metadata.google",
+    # Perturbations available to the robustness probe. They are random,
+    # black-box noise: no gradients or model internals are used, so they are
+    # NOT implementations of FGSM, PGD, C&W or DeepFool.
+    PERTURBATIONS: tuple[str, ...] = (
+        "sign_noise",
+        "iterative_sign_noise",
+        "gaussian_noise_small",
+        "gaussian_noise",
     )
 
+    @staticmethod
+    def _resolve_host(hostname: str) -> list[str]:
+        """Resolve a hostname to every IP address it maps to."""
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        return sorted({str(info[4][0]) for info in infos})
+
     def _validate_target_endpoint(self, target_endpoint: str) -> None:
-        """Block requests to internal/private networks (SSRF prevention)."""
-        endpoint_lower = target_endpoint.lower()
-        for blocked in self._BLOCKED_TARGETS:
-            if blocked in endpoint_lower:
+        """Allow only http(s) URLs whose host resolves to public addresses.
+
+        SSRF prevention for the networked sandbox. The previous substring
+        deny-list missed decimal or IPv6-mapped IPs, CGNAT and private IPv6
+        ranges, and hostnames that resolve to private addresses.
+
+        Residual risk: the sandbox resolves the name again when it connects,
+        so DNS rebinding can still reach an internal address. Closing that
+        needs an egress policy on the sandbox network, not application code.
+
+        Raises:
+            PermissionError: The endpoint is not an allowed external target.
+        """
+        parts = urlsplit(target_endpoint.strip())
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            msg = f"Target endpoint blocked: only http(s) URLs are allowed: {target_endpoint}"
+            raise PermissionError(msg)
+        if parts.username or parts.password:
+            msg = f"Target endpoint blocked: credentials in URL: {target_endpoint}"
+            raise PermissionError(msg)
+
+        try:
+            addresses = self._resolve_host(parts.hostname)
+        except (OSError, UnicodeError) as exc:
+            msg = f"Target endpoint blocked: cannot resolve host: {target_endpoint}"
+            raise PermissionError(msg) from exc
+        if not addresses:
+            msg = f"Target endpoint blocked: host has no addresses: {target_endpoint}"
+            raise PermissionError(msg)
+
+        for address in addresses:
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                ip = ip.ipv4_mapped
+            if not ip.is_global:
                 msg = f"Target endpoint blocked (SSRF prevention): {target_endpoint}"
                 raise PermissionError(msg)
 
     async def adversarial_evasion(
         self,
         target_endpoint: str,
-        attack_type: str = "fgsm",
+        attack_type: str = "sign_noise",
     ) -> dict[str, Any]:
-        """Run adversarial evasion attacks against a fraud detection model endpoint.
+        """Probe a model endpoint's robustness to random input perturbations.
+
+        Black-box check: sends random samples, adds random noise and counts
+        how often the prediction changes. It does not compute gradients, so
+        it is a robustness probe, not an implementation of FGSM/PGD/C&W.
 
         Uses the networked sandbox since it needs to reach external endpoints.
         Target must be an external endpoint — internal networks are blocked.
         """
-        self._validate_target_endpoint(target_endpoint)
+        if attack_type not in self.PERTURBATIONS:
+            msg = f"Unknown perturbation {attack_type!r}; expected one of {self.PERTURBATIONS}"
+            raise ValueError(msg)
+        await asyncio.to_thread(self._validate_target_endpoint, target_endpoint)
         logger.info(
             "adversarial_evasion: target=%s, attack_type=%s",
             target_endpoint,
@@ -992,8 +1025,8 @@ class ToolImplementations:
 
             os.makedirs("/workspace/output", exist_ok=True)
 
-            TARGET_ENDPOINT = "{endpoint}"
-            ATTACK_TYPE = "{attack_type}"
+            TARGET_ENDPOINT = {endpoint!r}
+            ATTACK_TYPE = {attack_type!r}
             NUM_SAMPLES = 20
 
             result = {{
@@ -1042,22 +1075,20 @@ class ToolImplementations:
                 orig_pred = orig_resp.get("prediction", orig_resp.get("score", None))
                 result["original_predictions"].append({{"index": i, "prediction": orig_pred}})
 
-                # Apply perturbation based on attack type
-                if ATTACK_TYPE == "fgsm":
+                # Random black-box perturbations (no gradients are used)
+                if ATTACK_TYPE == "sign_noise":
                     epsilon = 0.1
                     perturbation = epsilon * np.sign(np.random.randn(*sample.shape))
-                elif ATTACK_TYPE == "pgd":
+                elif ATTACK_TYPE == "iterative_sign_noise":
                     epsilon = 0.05
                     perturbation = np.zeros_like(sample)
                     for step in range(10):
                         perturbation += epsilon / 10 * np.sign(np.random.randn(*sample.shape))
                     perturbation = np.clip(perturbation, -epsilon, epsilon)
-                elif ATTACK_TYPE == "cw":
+                elif ATTACK_TYPE == "gaussian_noise_small":
                     perturbation = 0.01 * np.random.randn(*sample.shape).astype(np.float32)
-                elif ATTACK_TYPE == "deepfool":
+                else:  # gaussian_noise
                     perturbation = 0.05 * np.random.randn(*sample.shape).astype(np.float32)
-                else:
-                    perturbation = 0.1 * np.sign(np.random.randn(*sample.shape))
 
                 adv_sample = np.clip(sample + perturbation, 0, 1)
                 perturbations.append(float(np.linalg.norm(perturbation)))
@@ -1116,7 +1147,7 @@ class ToolImplementations:
         Uses the networked sandbox since it needs to reach external endpoints.
         Target must be an external endpoint — internal networks are blocked.
         """
-        self._validate_target_endpoint(target_endpoint)
+        await asyncio.to_thread(self._validate_target_endpoint, target_endpoint)
         logger.info(
             "prompt_injection_suite: target=%s, system_prompt=%s",
             target_endpoint,
@@ -1144,7 +1175,7 @@ class ToolImplementations:
 
             os.makedirs("/workspace/output", exist_ok=True)
 
-            TARGET_ENDPOINT = "{endpoint}"
+            TARGET_ENDPOINT = {endpoint!r}
             SYSTEM_PROMPT = {sys_prompt_repr}
 
             PAYLOADS = [
