@@ -51,8 +51,21 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+# uv.lock does NOT pin PEP 517 build requirements. These exact constraints pin the
+# build backend and its transitive deps (resolved 2026-11-09 for Python 3.11:
+# `uv pip compile` of hatchling==1.33.0) for every isolated project build.
+build-constraint-dependencies = [
+    "hatchling==1.33.0",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.7.0",
+    "tomlkit==0.15.2",
+    "trove-classifiers==2026.9.21.13",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fraudai"]
