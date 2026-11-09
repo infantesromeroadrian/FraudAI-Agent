@@ -30,7 +30,7 @@ La GPU NVIDIA es necesaria para Ollama (modelo local Llama 3.1 8B que ejecuta Do
 | **NVIDIA Container Toolkit** | 1.14+ | `nvidia-ctk --version` |
 | **NVIDIA GPU Driver** | 535+ | `nvidia-smi` |
 | **Python** | 3.11.x (>=3.11,<3.12; `.python-version` 3.11.16) | `python --version` (solo para desarrollo local) |
-| **uv** | 0.12.19 (version usada en CI) | `uv --version` (solo para desarrollo local) |
+| **uv** | 0.12.19 (fijada solo en Docker y en el job CI del contenedor; no fijada en jobs nativos ni en local) | `uv --version` (solo para desarrollo local) |
 | **curl** | Cualquiera | Para verificaciones de salud |
 
 ### 1.3 Cuentas y API keys
