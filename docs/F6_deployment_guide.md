@@ -47,7 +47,7 @@ La GPU NVIDIA es necesaria para Ollama (modelo local Llama 3.1 8B que ejecuta Do
 
 ```bash
 # 1. Clonar el repositorio
-git clone https://github.com/adrianinfantes/FraudAI-Agent.git
+git clone https://github.com/infantesromeroadrian/FraudAI-Agent.git
 cd FraudAI-Agent
 
 # 2. Configurar variables de entorno
@@ -58,7 +58,7 @@ cp .env.example .env
 ./scripts/setup-dev.sh
 
 # 4. Instalar dependencias Python (desarrollo local)
-uv sync
+uv sync --extra dev
 
 # 5. Arrancar la aplicacion
 uv run uvicorn fraudai.api.app:create_app --factory --reload --host 0.0.0.0 --port 8000
@@ -200,7 +200,7 @@ docker compose version    # >= 2.20
 nvidia-smi                # GPU visible
 
 # Paso 2: Clonar y configurar
-git clone https://github.com/adrianinfantes/FraudAI-Agent.git
+git clone https://github.com/infantesromeroadrian/FraudAI-Agent.git
 cd FraudAI-Agent
 cp .env.example .env
 # Editar .env: poner ANTHROPIC_API_KEY
@@ -214,7 +214,7 @@ cp .env.example .env
 #   - Descarga el modelo Llama 3.1 8B en Ollama (~4.7 GB)
 
 # Paso 4: Instalar dependencias Python
-uv sync
+uv sync --extra dev
 
 # Paso 5: Arrancar la API
 uv run uvicorn fraudai.api.app:create_app --factory --reload --host 0.0.0.0 --port 8000
