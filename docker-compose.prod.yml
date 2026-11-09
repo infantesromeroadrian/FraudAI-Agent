@@ -28,6 +28,11 @@ services:
       QDRANT_GRPC_PORT: 6334
       OLLAMA_HOST: http://ollama:11434
       ENVIRONMENT: production
+      # ADR-007 / D4-B: this container has no docker.sock, so it cannot run
+      # sandboxes. Sandbox-backed tools (incl. offensive red-teaming ones) answer
+      # with an explicit "sandbox_disabled" error instead of a stub. Do NOT mount
+      # /var/run/docker.sock here; run the API on a Docker host to enable them.
+      SANDBOX_MODE: disabled
     depends_on:
       qdrant:
         condition: service_healthy
@@ -175,7 +180,9 @@ services:
 
   # ---------------------------------------------------------------------------
   # Sandbox Image (build-only -- not a running service)
-  # Builds the sandbox image used by SandboxEngine for code execution.
+  # Builds the sandbox image used by SandboxEngine for code execution when the
+  # API runs on a Docker host (SANDBOX_MODE=docker). The containerised API above
+  # does not use it (SANDBOX_MODE=disabled, ADR-007).
   # ---------------------------------------------------------------------------
   sandbox:
     build:

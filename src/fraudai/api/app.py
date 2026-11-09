@@ -16,7 +16,11 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
+
+    from fraudai.core.config import Settings
+    from fraudai.tools.implementations import ToolImplementations
+    from fraudai.tools.sandbox import SandboxEngine
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +31,70 @@ from fraudai.api.session_manager import SessionManager
 from fraudai.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class SandboxStartupError(RuntimeError):
+    """The sandbox is required (SANDBOX_MODE=docker) but Docker or the image is unusable."""
+
+
+async def init_sandbox_tools(
+    cfg: Settings,
+    engine_factory: Callable[[], SandboxEngine] | None = None,
+) -> tuple[SandboxEngine | None, ToolImplementations]:
+    """Build the tool implementations for the configured sandbox mode (fail closed).
+
+    - ``disabled``: Docker is never touched; sandbox-backed tools answer with an
+      explicit ``sandbox_disabled`` error.
+    - ``docker`` and healthy: real implementations.
+    - ``docker`` but Docker/image unusable: staging and production refuse to
+      start; development starts with explicit ``sandbox_unavailable`` errors.
+      A failed sandbox never degrades to stub data.
+    """
+    from docker.errors import DockerException
+
+    from fraudai.tools.implementations import SandboxDisabled, ToolImplementations
+    from fraudai.tools.sandbox import SandboxEngine
+
+    if cfg.sandbox_mode == "disabled":
+        logger.warning("Sandbox disabled by configuration (SANDBOX_MODE=disabled)")
+        return None, ToolImplementations(
+            sandbox=None,
+            disabled=SandboxDisabled(
+                code="sandbox_disabled",
+                reason=(
+                    "Sandbox-backed tools (including offensive red-teaming tools) are "
+                    "disabled in this deployment (SANDBOX_MODE=disabled)."
+                ),
+            ),
+        )
+
+    def default_factory() -> SandboxEngine:
+        return SandboxEngine(
+            image=cfg.sandbox_image,
+            timeout=cfg.sandbox_timeout_seconds,
+            mem_limit=cfg.sandbox_mem_limit,
+            cpu_count=cfg.sandbox_cpu_count,
+            pids_limit=cfg.sandbox_pids_limit,
+            max_concurrent=cfg.sandbox_max_concurrent,
+        )
+
+    failure = "Docker is not reachable or the sandbox image is missing"
+    try:
+        engine = (engine_factory or default_factory)()
+        if await engine.health_check():
+            logger.info("SandboxEngine healthy -- real tool implementations enabled")
+            return engine, ToolImplementations(sandbox=engine)
+    except (DockerException, OSError):
+        logger.exception("Sandbox initialization failed")
+
+    if cfg.environment != "development":
+        msg = f"{failure} (image={cfg.sandbox_image}); refusing to start in {cfg.environment}"
+        raise SandboxStartupError(msg)
+    logger.error("%s -- sandbox-backed tools will return explicit errors", failure)
+    return None, ToolImplementations(
+        sandbox=None,
+        disabled=SandboxDisabled(code="sandbox_unavailable", reason=f"{failure}."),
+    )
 
 
 @asynccontextmanager
@@ -56,34 +124,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     except Exception:
         logger.exception("QdrantStore initialization failed -- continuing in degraded mode")
 
+    # Sandbox first and outside the degraded-mode try/except below: a required
+    # sandbox that is unusable must stop startup instead of being swallowed.
+    sandbox, tool_impls = await init_sandbox_tools(settings)
+
     # RAG retriever + tool registry (Bug #4 fix: wire ToolRegistry into runtime)
     from fraudai.agents.tool_registry import ToolRegistry
     from fraudai.ingestion.embeddings import EmbeddingGenerator
     from fraudai.rag.retriever import LegalRetriever
-    from fraudai.tools.implementations import ToolImplementations
-    from fraudai.tools.sandbox import SandboxEngine
 
     try:
         embedder = EmbeddingGenerator(
             device="cpu"
         )  # CPU for API queries; GPU reserved for ingestion
         retriever = LegalRetriever(store=store, embedder=embedder)
-
-        # Attempt to initialise the sandbox for real tool implementations.
-        # If Docker is unavailable or the sandbox image is missing, gracefully
-        # degrade to stubs — never crash the startup.
-        sandbox: SandboxEngine | None = None
-        tool_impls: ToolImplementations | None = None
-        try:
-            sandbox = SandboxEngine()
-            sandbox_healthy = await sandbox.health_check()
-            if sandbox_healthy:
-                tool_impls = ToolImplementations(sandbox=sandbox)
-                logger.info("SandboxEngine healthy — real tool implementations enabled")
-            else:
-                logger.warning("Sandbox not healthy — tools will use stubs")
-        except Exception:
-            logger.exception("Sandbox initialization failed — tools will use stubs")
 
         tool_registry = ToolRegistry(
             retriever=retriever,
@@ -93,7 +147,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         logger.info(
             "ToolRegistry initialized (retriever=LegalRetriever, sandbox=%s, tool_impls=%s)",
             "enabled" if sandbox is not None else "disabled",
-            "enabled" if tool_impls is not None else "stubs",
+            "enabled" if sandbox is not None else "explicit-errors",
         )
     except Exception:
         logger.exception("ToolRegistry initialization failed — tools will use stubs")
