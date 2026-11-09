@@ -12,7 +12,9 @@ Reference requirements:
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, StrictBool
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -140,6 +142,31 @@ class ChatRequest(BaseModel):
     )
 
 
+class PendingAction(BaseModel):
+    """One offensive tool call waiting for the user's explicit decision (R2).
+
+    Shown verbatim to the user: ``arguments`` is exactly what will run if the
+    call is approved.  Resolve it with ``POST /confirm`` using ``action_id``.
+    Values inside ``arguments`` and ``target`` come from the model and must be
+    rendered as plain text, never as markup.
+    """
+
+    kind: Literal["offensive_tool_approval"] = "offensive_tool_approval"
+    action_id: str = Field(
+        description="Server-issued id of this call; /confirm must echo it.",
+    )
+    agent: str = Field(description="Agent that proposed the call (e.g. 'mike').")
+    tool: str = Field(description="Tool that will run (e.g. 'adversarial_evasion').")
+    arguments: dict[str, object] = Field(
+        description="Exact arguments the tool will receive.",
+    )
+    target: str | None = Field(
+        default=None,
+        description="Target extracted from the arguments, when one is identifiable.",
+    )
+    warning: str = Field(description="Plain-language risk notice.")
+
+
 class ChatResponse(BaseModel):
     """Response from a FraudAI agent after processing a user message."""
 
@@ -161,6 +188,13 @@ class ChatResponse(BaseModel):
         description="Results from tools executed during this turn.",
     )
     metadata: ResponseMetadata
+    pending_action: PendingAction | None = Field(
+        default=None,
+        description=(
+            "Set when the turn paused for approval. Nothing offensive has run; "
+            "``message`` is a generic notice and the details are in this object."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +268,12 @@ class ConfirmationRequest(BaseModel):
         description="Session with a pending confirmation.",
     )
     action_id: str = Field(
-        description="Identifier of the pending action to confirm or reject.",
+        min_length=1,
+        max_length=64,
+        description="``action_id`` of the pending action; stale or unknown ids are refused.",
     )
-    approved: bool = Field(
-        description="True to approve execution, False to reject.",
+    approved: StrictBool = Field(
+        description="JSON true to approve, false to reject; strings and numbers are refused.",
     )
 
 

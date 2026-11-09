@@ -293,25 +293,74 @@ class TestE2ELeyLouisRouting:
 
 
 class TestE2ERedTeamingMikeRouting:
-    """4. E2E: Red teaming -> Mike routing.
+    """4. E2E: Red teaming -> Mike -> per-call human approval (R2).
 
-    Mike requires human confirmation (HITL interrupt) when routed via Donna.
-    We use agent_override to bypass HITL and verify Mike responds directly.
+    Mike plans with the model, then the graph pauses on the concrete call.  The
+    old test only checked that ``message`` was non-empty, which the paused graph
+    satisfied with "No response generated."; this one checks what the client
+    must actually see and that nothing ran before the decision.
     """
 
-    async def test_pentest_routes_to_mike_via_override(self, client: AsyncClient) -> None:
-        """Use agent_override to skip HITL and verify Mike responds."""
+    @staticmethod
+    def _install_planning_invoker(target: str) -> MagicMock:
+        plan = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "adversarial_evasion", "args": {"target_endpoint": target}, "id": "c1"}
+            ],
+        )
+        final = AIMessage(content="Se recomienda aplicar adversarial training.")
+        invoker = MagicMock()
+        invoker.plan = AsyncMock(return_value=plan)
+        invoker.respond_with_tool_results = AsyncMock(return_value=final)
+        invoker.build_result = MagicMock(
+            return_value={
+                "message": final,
+                "tool_results": [],
+                "analysis_summary": None,
+                "escalation": None,
+            }
+        )
+        graph_mod._claude_invoker = invoker
+        return invoker
+
+    async def test_pentest_pauses_on_the_concrete_call_until_confirmed(
+        self, client: AsyncClient
+    ) -> None:
+        target = "https://models.example.com/predict"
+        invoker = self._install_planning_invoker(target)
+
         resp = await client.post(
             "/api/v1/chat",
             json=_chat_payload(
-                "Necesito hacer un pentest a un modelo de ML",
-                agent_override="mike",
+                "Necesito hacer un pentest a un modelo de ML", agent_override="mike"
             ),
         )
+
         assert resp.status_code == 200
         data = resp.json()
         assert data["agent"] == "mike"
-        assert data["message"]
+        assert "No response generated" not in data["message"]
+        action = data["pending_action"]
+        assert (action["tool"], action["target"]) == ("adversarial_evasion", target)
+        assert action["arguments"] == {"target_endpoint": target}
+        assert data["tool_results"] == []
+        invoker.respond_with_tool_results.assert_not_awaited()
+
+        confirmed = await client.post(
+            "/api/v1/confirm",
+            json={
+                "session_id": data["session_id"],
+                "action_id": action["action_id"],
+                "approved": True,
+            },
+        )
+
+        assert confirmed.status_code == 200
+        done = confirmed.json()
+        assert done["pending_action"] is None
+        assert "adversarial training" in done["message"]
+        invoker.plan.assert_awaited_once()  # the approval resumed; it did not re-plan
 
 
 class TestE2EPipelineRachelRouting:

@@ -12,6 +12,7 @@ import io
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -41,10 +42,31 @@ UUID_CSV_NAME = re.compile(r"^[0-9a-f-]{36}\.csv$")
 
 
 class _SpyGraph:
-    """Records every thread the routes try to run."""
+    """Records every thread the routes try to run or read state for."""
 
     def __init__(self) -> None:
         self.threads: list[str] = []
+        self.state_reads: list[str] = []
+        self._paused: set[str] = set()
+
+    def pause(self, thread_id: str) -> None:
+        """Make ``aget_state`` report an approval pending on this thread."""
+        self._paused.add(thread_id)
+
+    async def aget_state(self, config: dict[str, Any]) -> Any:
+        thread_id = config["configurable"]["thread_id"]
+        self.state_reads.append(thread_id)
+        pending = {
+            "kind": "offensive_tool_approval",
+            "action_id": "any",
+            "agent": "mike",
+            "tool": "adversarial_evasion",
+            "arguments": {},
+            "target": None,
+            "warning": "w",
+        }
+        interrupts = (SimpleNamespace(value=pending),) if thread_id in self._paused else ()
+        return SimpleNamespace(tasks=(SimpleNamespace(interrupts=interrupts),))
 
     async def ainvoke(self, payload: Any, config: dict[str, Any]) -> dict[str, Any]:
         self.threads.append(config["configurable"]["thread_id"])
@@ -181,8 +203,11 @@ async def test_own_session_is_served(
     ok_status: int,
     client: httpx.AsyncClient,
     sessions: SessionManager,
+    spy_graph: _SpyGraph,
 ) -> None:
     own_id = sessions.create_session(OWNER_TENANT, "pro")
+    if name == "confirm":
+        spy_graph.pause(own_id)  # /confirm needs an action awaiting approval
 
     response = await call(client, own_id, _bearer(OWNER_TENANT))
 
@@ -214,6 +239,7 @@ async def test_foreign_and_unknown_sessions_are_rejected_without_side_effects(
 
     assert response.status_code == 404
     assert spy_graph.threads == [], "graph ran for a session the caller does not own"
+    assert spy_graph.state_reads == [], "graph state read for a session the caller does not own"
     store.create_session_collection.assert_not_called()
     store.upsert_chunks.assert_not_called()
     store.delete_session_collection.assert_not_called()
