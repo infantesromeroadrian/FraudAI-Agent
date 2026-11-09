@@ -98,6 +98,11 @@ jobs:
       # import cleanly with no secrets and no network/LLM access.
       - name: Smoke import API image
         run: docker run --rm --network none "$API_IMAGE" python -c "import fraudai.api.app as m; print(m.__file__)"
+      # Trivy: vulnerability scan only (`scanners: vuln` -> TRIVY_SCANNERS). Trivy's default
+      # also runs the secret scanner, which flags documentation examples such as
+      # `{"type": "service_account"}` inside the anthropic SDK docstrings as CRITICAL
+      # "gcp-service-account" (false positives). Secret scanning stays covered by the
+      # TruffleHog job in security.yml.
       # Trivy: reports are always produced (artifact), then the gate fails on
       # HIGH/CRITICAL findings that already have a fix available.
       - name: Trivy report (API image)
@@ -106,6 +111,7 @@ jobs:
           image-ref: ${{ env.API_IMAGE }}
           format: table
           output: trivy-api.txt
+          scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "0"
@@ -115,6 +121,7 @@ jobs:
           image-ref: ${{ env.SANDBOX_IMAGE }}
           format: table
           output: trivy-sandbox.txt
+          scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "0"
@@ -129,6 +136,7 @@ jobs:
         with:
           image-ref: ${{ env.API_IMAGE }}
           format: table
+          scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
@@ -137,6 +145,7 @@ jobs:
         with:
           image-ref: ${{ env.SANDBOX_IMAGE }}
           format: table
+          scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
