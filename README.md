@@ -14,8 +14,7 @@
   <img src="https://img.shields.io/badge/FastAPI-0.115+-green?logo=fastapi" alt="FastAPI" />
   <img src="https://img.shields.io/badge/Next.js-14+-black?logo=next.js" alt="Next.js" />
   <img src="https://img.shields.io/badge/Qdrant-Vector_DB-red" alt="Qdrant" />
-  <img src="https://img.shields.io/badge/Tests-482_passing-brightgreen" alt="Tests" />
-  <img src="https://img.shields.io/badge/Coverage-93%25-brightgreen" alt="Coverage" />
+  <a href="https://github.com/infantesromeroadrian/FraudAI-Agent/actions/workflows/ci.yml"><img src="https://github.com/infantesromeroadrian/FraudAI-Agent/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License" />
 </p>
 
@@ -25,7 +24,7 @@
 
 A Level 3 agentic AI platform (advisory + analysis + **execution**) that simulates a fraud investigation law firm. Six specialized AI agents — inspired by the characters of *Suits* — collaborate to detect fraud, ensure regulatory compliance, investigate criminal networks, and red-team AI systems.
 
-Unlike simple LLM wrappers, FraudAI agents **execute real tools**: analyze transaction datasets, generate compliance reports, build fraud network graphs, and run adversarial attacks against ML models — all inside sandboxed Docker containers.
+Unlike simple LLM wrappers, FraudAI agents **execute real tools**: analyze transaction datasets, generate compliance reports, build fraud network graphs, and run robustness probes and prompt-injection tests against ML and LLM endpoints — all inside sandboxed Docker containers.
 
 ### Agents
 
@@ -35,7 +34,7 @@ Unlike simple LLM wrappers, FraudAI agents **execute real tools**: analyze trans
 | **Harvey Specter** | Transaction Fraud Detection | Direct, confident. Analyzes transactions, detects anomalies, scores risk |
 | **Louis Litt** | AML / KYC / Compliance | Meticulous. Cites exact legal articles, generates SAR reports |
 | **Jessica Pearson** | Fraud Intelligence | Strategic. Network graph analysis, identity resolution |
-| **Mike Ross** | AI Red Teaming | Creative. Adversarial attacks, prompt injection testing |
+| **Mike Ross** | AI Red Teaming | Creative. Random-perturbation robustness probes, prompt injection testing |
 | **Rachel Zane** | Data Engineering | Rigorous. ETL pipelines, feature engineering, data quality |
 
 ---
@@ -140,7 +139,7 @@ src/fraudai/
 frontend/          # Next.js 14 chat UI with SSE streaming
 monitoring/        # Prometheus alerts, Grafana dashboards
 docs/              # ADRs, requirements, API reference, runbook
-tests/             # 482 unit + 23 live smoke tests
+tests/             # 512 unit/integration + 23 live smoke tests
 ```
 
 ---
@@ -162,8 +161,9 @@ tests/             # 482 unit + 23 live smoke tests
 ## Testing
 
 ```bash
-# Unit + integration tests (482 tests, 93% coverage)
-uv run python -m pytest tests/ -q
+# Unit + integration tests: 512 tests, 92 % line coverage (measured 2026-11-09).
+# CI runs them on every push and pull request and fails below 80 % coverage.
+uv run python -m pytest tests/ -q --ignore=tests/test_smoke_live.py
 
 # Live smoke tests (requires running backend)
 ./scripts/smoke-test.sh
@@ -197,6 +197,22 @@ This is a **portfolio project** demonstrating AI agent architecture for FinTech 
 - SQLite persistence
 - Prometheus metrics
 
+**Known limits:**
+- `adversarial_evasion` is a black-box **random-perturbation** robustness probe. It uses no gradients, so it is not an implementation of FGSM, PGD, C&W or DeepFool.
+- The RAG evaluator computes context precision and recall; `faithfulness` and `answer_relevancy` are placeholders that return `0.0` until an LLM-as-judge is wired in.
+- Sandbox isolation is covered by unit tests with a mocked Docker client and by image builds in CI, not by a live escape test.
+- Development and staging accept any login and the literal `dev-token`. Production refuses to start without a `JWT_SECRET` of at least 32 characters, and `/auth/token` returns 501 until a user store exists.
+
+---
+
+## Security Notes
+
+- **Red-team targets.** The networked sandbox only accepts public `http(s)` endpoints. Every resolved address of the host must be public; loopback, private, link-local, CGNAT, unique-local IPv6 and IPv4-mapped forms are rejected, as are URLs with credentials. Residual risk: DNS rebinding between the check and the sandbox connection; closing it needs an egress policy on the sandbox network.
+- **Generated code.** Tool arguments are embedded in sandbox code as Python literals (`repr`), and the perturbation type comes from a fixed allow-list, so a crafted endpoint or argument cannot inject code.
+- **Input files.** Sandbox inputs must resolve inside the allowed directories; prefix look-alikes and symlinks that escape them are rejected.
+- **Local services.** Docker Compose publishes Qdrant and Ollama on `127.0.0.1` only; neither has authentication enabled.
+- **Supply chain.** GitHub Actions are pinned to commit SHAs and run with a read-only token. A weekly workflow runs `pip-audit` and TruffleHog.
+
 ---
 
 ## Author
@@ -204,7 +220,7 @@ This is a **portfolio project** demonstrating AI agent architecture for FinTech 
 **Adrian Infantes** — Senior AI Engineer specializing in FinTech, fraud detection, and AI red teaming.
 
 - [LinkedIn](https://linkedin.com/in/adrianinfantes)
-- [GitHub](https://github.com/adrianinfantes)
+- [GitHub](https://github.com/infantesromeroadrian)
 
 ---
 

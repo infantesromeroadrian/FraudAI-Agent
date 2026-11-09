@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Self
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
+
+# Placeholder secrets shipped in the code and in .env.example. A production
+# process signed with one of these would accept tokens forged by anyone.
+_PLACEHOLDER_JWT_SECRETS = frozenset(
+    {"fraudai-dev-secret-change-in-production", "change-this-in-production"}
+)
+_MIN_JWT_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -36,6 +46,20 @@ class Settings(BaseSettings):
     cors_allowed_origins: str = "http://localhost:3000"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @model_validator(mode="after")
+    def _require_real_jwt_secret_in_production(self) -> Self:
+        """Refuse to start in production with a placeholder or short JWT secret."""
+        if self.environment == "production" and (
+            self.jwt_secret in _PLACEHOLDER_JWT_SECRETS
+            or len(self.jwt_secret) < _MIN_JWT_SECRET_LENGTH
+        ):
+            msg = (
+                "JWT_SECRET must be set to a random value of at least "
+                f"{_MIN_JWT_SECRET_LENGTH} characters when ENVIRONMENT=production"
+            )
+            raise ValueError(msg)
+        return self
 
 
 settings = Settings()
