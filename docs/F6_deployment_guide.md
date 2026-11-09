@@ -29,8 +29,8 @@ La GPU NVIDIA es necesaria para Ollama (modelo local Llama 3.1 8B que ejecuta Do
 | **Docker Compose** | v2.20+ | `docker compose version` |
 | **NVIDIA Container Toolkit** | 1.14+ | `nvidia-ctk --version` |
 | **NVIDIA GPU Driver** | 535+ | `nvidia-smi` |
-| **Python** | 3.11+ | `python --version` (solo para desarrollo local) |
-| **uv** | 0.4+ | `uv --version` (solo para desarrollo local) |
+| **Python** | 3.11.x (>=3.11,<3.12; `.python-version` 3.11.16) | `python --version` (solo para desarrollo local) |
+| **uv** | 0.12.19 (version usada en CI) | `uv --version` (solo para desarrollo local) |
 | **curl** | Cualquiera | Para verificaciones de salud |
 
 ### 1.3 Cuentas y API keys
@@ -58,7 +58,7 @@ cp .env.example .env
 ./scripts/setup-dev.sh
 
 # 4. Instalar dependencias Python (desarrollo local)
-uv sync --extra dev
+uv sync --frozen --extra dev
 
 # 5. Arrancar la aplicacion
 uv run uvicorn fraudai.api.app:create_app --factory --reload --host 0.0.0.0 --port 8000
@@ -186,7 +186,7 @@ La aplicacion se ejecuta con uvicorn:
 - **Produccion (Docker):** `docker build -t fraudai-agent:latest . && docker run -p 8000:8000 --env-file .env fraudai-agent:latest`
 
 El Dockerfile usa multi-stage build:
-1. **Builder:** Instala dependencias con `uv` sobre `python:3.11-slim`
+1. **Builder:** Instala dependencias con `uv` sobre `python:3.11.18-slim-bookworm` (fijada por digest en el [Dockerfile](../Dockerfile))
 2. **Runtime:** Imagen minima con solo paquetes necesarios, usuario no-root (`fraudai`), health check integrado
 
 ---
@@ -216,7 +216,7 @@ cp .env.example .env
 #   - Descarga el modelo Llama 3.1 8B en Ollama (~4.7 GB)
 
 # Paso 4: Instalar dependencias Python
-uv sync --extra dev
+uv sync --frozen --extra dev
 
 # Paso 5: Arrancar la API
 uv run uvicorn fraudai.api.app:create_app --factory --reload --host 0.0.0.0 --port 8000
