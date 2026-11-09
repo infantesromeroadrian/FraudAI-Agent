@@ -94,7 +94,12 @@ class SessionManager:
         return self._sessions.get(session_id)
 
     def ensure_session(self, session_id: str, tenant_id: str, tier: str) -> str:
-        """Register a session if not already tracked. Returns the session ID."""
+        """Register a session under a caller-chosen ID (internal use only).
+
+        Never call this with an ID taken from a request: the API routes only
+        accept IDs issued by ``create_session`` and owned by the caller's
+        tenant. Kept for restore/migration paths that already trust the ID.
+        """
         if session_id not in self._sessions:
             self._sessions[session_id] = SessionData(
                 session_id=session_id,

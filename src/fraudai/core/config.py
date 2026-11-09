@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
@@ -42,7 +42,9 @@ class Settings(BaseSettings):
 
     # App
     log_level: str = "INFO"
-    environment: str = "development"
+    # Closed set: a typo such as "prod" or "PRODUCTION" must fail at startup
+    # instead of silently skipping the production-only checks.
+    environment: Literal["development", "staging", "production"] = "development"
     cors_allowed_origins: str = "http://localhost:3000"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

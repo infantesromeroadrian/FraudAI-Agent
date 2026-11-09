@@ -20,12 +20,11 @@ import ipaddress
 import json
 import logging
 import socket
-import tempfile
 import textwrap
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from fraudai.core.session_context import active_session_id, upload_dir
 from fraudai.tools.sandbox import SandboxEngine, SandboxResult
 
 logger = logging.getLogger(__name__)
@@ -121,26 +120,32 @@ class ToolImplementations:
         parsed["duration_seconds"] = result.duration_seconds
         return parsed
 
-    # Allowed base directories for input files (uploads + temp)
-    ALLOWED_INPUT_DIRS: list[str] = [
-        str(Path(tempfile.gettempdir()) / "fraudai_uploads"),
-        str(Path(tempfile.gettempdir())),  # General tmp for sandbox inputs
-    ]
-
     def _read_input_file(self, data_path: str) -> bytes:
-        """Read a local file to pass into the sandbox as input.
+        """Read an uploaded file of the active session to pass into the sandbox.
 
-        Validates that the resolved path is within allowed directories
-        to prevent path traversal attacks from LLM tool calls.
+        The session comes from the request context bound by the API after the
+        ownership check, never from the (model-supplied) path. Only files under
+        that session's upload directory are readable: other sessions' uploads,
+        the rest of the temp directory and symlinks leading outside are denied.
+        Relative paths are resolved inside the session directory.
         """
-        path = Path(data_path).resolve()
-        # Compare resolved paths, not string prefixes: "/tmpx/secret" starts
-        # with "/tmp", and on macOS the temp dir is a symlink (/var -> /private/var).
-        allowed = [Path(d).resolve() for d in self.ALLOWED_INPUT_DIRS]
-        if not any(path.is_relative_to(base) for base in allowed):
-            msg = f"Access denied: path '{data_path}' is outside allowed directories"
+        session_id = active_session_id()
+        if session_id is None:
+            msg = "Access denied: no active session for input files"
             raise PermissionError(msg)
-        if not path.exists():
+        try:
+            base = upload_dir(session_id).resolve()
+        except ValueError as exc:
+            msg = "Access denied: invalid session for input files"
+            raise PermissionError(msg) from exc
+
+        # Resolve first (follows symlinks and ".."), then compare path parts:
+        # string prefixes would accept "/tmpx/..." and macOS /var -> /private/var.
+        path = (base / data_path).resolve()
+        if path == base or not path.is_relative_to(base):
+            msg = f"Access denied: path '{data_path}' is outside the session upload directory"
+            raise PermissionError(msg)
+        if not path.is_file():
             msg = f"Input file not found: {data_path}"
             raise FileNotFoundError(msg)
         return path.read_bytes()

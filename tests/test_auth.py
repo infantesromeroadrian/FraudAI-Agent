@@ -18,11 +18,13 @@ from unittest.mock import MagicMock, patch
 import httpx
 import jwt
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from fraudai.api.auth import (
     JWT_ALGORITHM,
+    JWT_AUDIENCE,
     JWT_EXPIRATION_HOURS,
+    JWT_ISSUER,
     create_token,
     get_current_user,
 )
@@ -47,6 +49,26 @@ def _mock_settings(**overrides: Any) -> MagicMock:
     }
     defaults.update(overrides)
     return MagicMock(**defaults)
+
+
+def _forge_token(
+    *, drop: tuple[str, ...] = (), signing_key: str = _DEV_SIGNING_KEY, **claims: Any
+) -> str:
+    """Sign a token with valid default claims, overriding or dropping some."""
+    now = datetime.now(UTC)
+    payload: dict[str, Any] = {
+        "sub": "alice",
+        "tenant_id": "acme",
+        "tier": "pro",
+        "exp": now + timedelta(hours=1),
+        "iat": now,
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
+    }
+    payload.update(claims)
+    for name in drop:
+        payload.pop(name, None)
+    return jwt.encode(payload, signing_key, algorithm=JWT_ALGORITHM)
 
 
 # ---------------------------------------------------------------------------
@@ -104,17 +126,23 @@ class TestCreateToken:
                 email="bob@acme.com",
                 is_admin=True,
             )
-        payload = jwt.decode(token, _DEV_SIGNING_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token, _DEV_SIGNING_KEY, algorithms=[JWT_ALGORITHM], audience=JWT_AUDIENCE
+        )
         assert payload["sub"] == "bob"
         assert payload["tenant_id"] == "acme"
         assert payload["tier"] == "enterprise"
         assert payload["email"] == "bob@acme.com"
         assert payload["is_admin"] is True
+        assert payload["iss"] == JWT_ISSUER
+        assert payload["aud"] == JWT_AUDIENCE
 
     def test_token_has_expiration(self) -> None:
         with patch("fraudai.core.config.settings", _mock_settings()):
             token = create_token(user_id="carol", tenant_id="t1", tier="free")
-        payload = jwt.decode(token, _DEV_SIGNING_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token, _DEV_SIGNING_KEY, algorithms=[JWT_ALGORITHM], audience=JWT_AUDIENCE
+        )
         assert "exp" in payload
         assert "iat" in payload
         # exp should be ~24 hours from now
@@ -126,7 +154,7 @@ class TestCreateToken:
         with patch("fraudai.core.config.settings", _mock_settings()):
             token = create_token(user_id="dave", tenant_id="t1", tier="pro")
         # Should not raise
-        jwt.decode(token, _DEV_SIGNING_KEY, algorithms=[JWT_ALGORITHM])
+        jwt.decode(token, _DEV_SIGNING_KEY, algorithms=[JWT_ALGORITHM], audience=JWT_AUDIENCE)
 
     def test_token_fails_with_wrong_key(self) -> None:
         with patch("fraudai.core.config.settings", _mock_settings()):
@@ -152,11 +180,14 @@ class TestGetCurrentUser:
         assert user.tier == "enterprise"
         assert user.is_admin is True
 
-    async def test_dev_token_in_staging(self) -> None:
-        """``dev-token`` works in staging too."""
-        with patch("fraudai.core.config.settings", _mock_settings(environment="staging")):
-            user = await get_current_user(token="dev-token")
-        assert user.user_id == "dev-user"
+    async def test_dev_token_rejected_in_staging(self) -> None:
+        """``dev-token`` must not grant admin outside development."""
+        with (
+            patch("fraudai.core.config.settings", _mock_settings(environment="staging")),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await get_current_user(token="dev-token")
+        assert exc_info.value.status_code == 401
 
     async def test_valid_jwt_returns_user(self) -> None:
         """A properly signed JWT returns the corresponding User."""
@@ -187,14 +218,11 @@ class TestGetCurrentUser:
 
     async def test_expired_jwt_returns_401(self) -> None:
         """An expired JWT raises HTTPException 401 with 'Token expired'."""
-        expired_payload = {
-            "sub": "expired-user",
-            "tenant_id": "t1",
-            "tier": "free",
-            "exp": datetime.now(UTC) - timedelta(hours=1),
-            "iat": datetime.now(UTC) - timedelta(hours=25),
-        }
-        token = jwt.encode(expired_payload, _DEV_SIGNING_KEY, algorithm=JWT_ALGORITHM)
+        token = _forge_token(
+            sub="expired-user",
+            exp=datetime.now(UTC) - timedelta(hours=1),
+            iat=datetime.now(UTC) - timedelta(hours=25),
+        )
 
         mock_s = _mock_settings(environment="production")
         with patch("fraudai.core.config.settings", mock_s):
@@ -240,6 +268,83 @@ class TestGetCurrentUser:
             assert exc_info.value.status_code == 401
 
 
+class TestMalformedTokens:
+    """Any structurally bad token is a 401, never an unhandled 500 (B4)."""
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            pytest.param(_forge_token(drop=("sub",)), id="missing_sub"),
+            pytest.param(_forge_token(sub=""), id="empty_sub"),
+            pytest.param(_forge_token(sub=42), id="non_string_sub"),
+            pytest.param(_forge_token(drop=("tenant_id",)), id="missing_tenant"),
+            pytest.param(_forge_token(tenant_id=""), id="empty_tenant"),
+            pytest.param(_forge_token(tenant_id=["a"]), id="non_string_tenant"),
+            pytest.param(_forge_token(drop=("tier",)), id="missing_tier"),
+            pytest.param(_forge_token(tier="root"), id="invalid_tier"),
+            pytest.param(_forge_token(tier=1), id="non_string_tier"),
+            pytest.param(_forge_token(is_admin="yes"), id="string_is_admin"),
+            pytest.param(_forge_token(is_admin=1), id="int_is_admin"),
+            pytest.param(_forge_token(email=["x"]), id="non_string_email"),
+            pytest.param(_forge_token(drop=("exp",)), id="missing_exp"),
+            pytest.param(_forge_token(drop=("iss",)), id="missing_iss"),
+            pytest.param(_forge_token(drop=("aud",)), id="missing_aud"),
+            pytest.param(_forge_token(iss="someone-else"), id="wrong_issuer"),
+            pytest.param(_forge_token(aud="another-api"), id="wrong_audience"),
+            pytest.param(_forge_token(signing_key="x" * 40), id="wrong_signature"),
+            pytest.param("", id="empty_token"),
+            pytest.param("a.b.c", id="garbage_segments"),
+        ],
+    )
+    async def test_rejected_with_401(self, token: str) -> None:
+        with (
+            patch("fraudai.core.config.settings", _mock_settings(environment="production")),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await get_current_user(token=token)
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.headers == {"WWW-Authenticate": "Bearer"}
+
+    async def test_alg_none_token_is_rejected(self) -> None:
+        unsigned = jwt.encode(
+            {
+                "sub": "a",
+                "tenant_id": "t",
+                "tier": "free",
+                "iss": JWT_ISSUER,
+                "aud": JWT_AUDIENCE,
+                "exp": datetime.now(UTC) + timedelta(hours=1),
+                "iat": datetime.now(UTC),
+            },
+            key=None,
+            algorithm="none",
+        )
+        with (
+            patch("fraudai.core.config.settings", _mock_settings(environment="production")),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await get_current_user(token=unsigned)
+        assert exc_info.value.status_code == 401
+
+    async def test_malformed_token_over_http_is_401_not_500(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        token = _forge_token(drop=("sub",))
+        with patch("fraudai.core.config.settings", _mock_settings(environment="production")):
+            resp = await client.get(
+                f"/api/v1/sessions/{'0' * 8}-0000-4000-8000-{'0' * 12}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 401
+
+    async def test_optional_claims_default_safely(self) -> None:
+        token = _forge_token()
+        with patch("fraudai.core.config.settings", _mock_settings(environment="production")):
+            user = await get_current_user(token=token)
+        assert user.email == ""
+        assert user.is_admin is False
+
+
 # ---------------------------------------------------------------------------
 # POST /auth/token -- integration tests
 # ---------------------------------------------------------------------------
@@ -262,10 +367,25 @@ class TestLoginEndpoint:
         assert data["expires_in"] == JWT_EXPIRATION_HOURS * 3600
 
         # The returned token should be a decodable JWT
-        payload = jwt.decode(data["access_token"], _DEV_SIGNING_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            data["access_token"],
+            _DEV_SIGNING_KEY,
+            algorithms=[JWT_ALGORITHM],
+            audience=JWT_AUDIENCE,
+        )
         assert payload["sub"] == "testuser"
         assert payload["tenant_id"] == "default"
         assert payload["tier"] == "enterprise"
+
+    async def test_login_returns_501_in_staging(self, client: httpx.AsyncClient) -> None:
+        """Staging has no free login: any credentials must not mint a token."""
+        with patch("fraudai.api.routes.settings", _mock_settings(environment="staging")):
+            resp = await client.post(
+                "/api/v1/auth/token",
+                data={"username": "anyone", "password": "anything"},
+            )
+        assert resp.status_code == 501
+        assert "access_token" not in resp.json()
 
     async def test_login_returns_501_in_production(self, client: httpx.AsyncClient) -> None:
         """Login in production returns 501 (not yet implemented)."""

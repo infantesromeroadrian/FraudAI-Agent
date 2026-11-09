@@ -18,7 +18,7 @@ from typing import Literal
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
 
@@ -26,6 +26,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
 # Secret is read from settings at call time to respect env overrides.
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
+JWT_ISSUER = "fraudai-agent"
+JWT_AUDIENCE = "fraudai-api"
+# Claims that must be present; PyJWT rejects the token otherwise.
+_REQUIRED_CLAIMS = ["exp", "iat", "iss", "aud", "sub", "tenant_id", "tier"]
 
 
 class User(BaseModel):
@@ -35,6 +39,21 @@ class User(BaseModel):
     tenant_id: str
     email: str
     tier: Literal["free", "pro", "enterprise"]
+    is_admin: bool = False
+
+
+class _TokenClaims(BaseModel):
+    """Strict shape of the claims we trust after the signature check.
+
+    ``strict`` blocks lax coercion (e.g. ``"yes"`` becoming ``is_admin=True``).
+    """
+
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    sub: str = Field(min_length=1)
+    tenant_id: str = Field(min_length=1)
+    tier: Literal["free", "pro", "enterprise"]
+    email: str = ""
     is_admin: bool = False
 
 
@@ -77,8 +96,18 @@ def create_token(
         "is_admin": is_admin,
         "exp": datetime.now(UTC) + timedelta(hours=JWT_EXPIRATION_HOURS),
         "iat": datetime.now(UTC),
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=JWT_ALGORITHM)
+
+
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def get_current_user(
@@ -86,51 +115,50 @@ async def get_current_user(
 ) -> User:
     """Validate JWT and return the authenticated user.
 
-    In development/staging mode, the special ``dev-token`` value bypasses
-    JWT validation and returns a dev user with enterprise tier. Any other
-    token is still validated as a real JWT so that the dev environment
-    can exercise the full auth flow.
+    Only in the ``development`` environment the literal ``dev-token`` value
+    bypasses JWT validation and returns a dev user with enterprise tier.
+    Staging and production always validate a real JWT. Any other token is
+    validated as a JWT in every environment.
 
-    In production:
-    1. Decodes and verifies the JWT signature (HS256 MVP).
-    2. Checks token expiration.
-    3. Builds the User model from token claims.
+    JWT validation:
+    1. Verifies the HS256 signature, ``exp``, ``iss`` and ``aud``.
+    2. Requires ``sub``, ``tenant_id`` and ``tier`` with the right types.
+    3. Builds the User model from the claims.
 
     Raises:
-        HTTPException 401: Invalid or expired token.
+        HTTPException 401: Missing, malformed, invalid or expired token.
     """
     from fraudai.core.config import settings
 
-    # Dev mode bypass — accept the literal "dev-token" string
-    if settings.environment in ("development", "staging") and token == "dev-token":
+    if settings.environment == "development" and token == "dev-token":
         return _DEV_USER
 
-    # JWT validation (works in all environments)
     try:
         payload = jwt.decode(
             token,
             settings.jwt_secret,
             algorithms=[JWT_ALGORITHM],
-        )
-        return User(
-            user_id=payload["sub"],
-            tenant_id=payload["tenant_id"],
-            email=payload.get("email", ""),
-            tier=payload.get("tier", "free"),
-            is_admin=payload.get("is_admin", False),
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+            options={"require": _REQUIRED_CLAIMS},
         )
     except jwt.ExpiredSignatureError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        raise _unauthorized("Token expired") from exc
     except jwt.InvalidTokenError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        raise _unauthorized("Invalid token") from exc
+
+    try:
+        claims = _TokenClaims.model_validate(payload)
+    except ValidationError as exc:
+        raise _unauthorized("Invalid token") from exc
+
+    return User(
+        user_id=claims.sub,
+        tenant_id=claims.tenant_id,
+        email=claims.email,
+        tier=claims.tier,
+        is_admin=claims.is_admin,
+    )
 
 
 async def get_admin_user(

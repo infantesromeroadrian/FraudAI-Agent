@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import socket
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
@@ -10,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import ValidationError
 
+from fraudai.core import session_context
 from fraudai.core.config import Settings
+from fraudai.core.session_context import active_session_id, bind_session
 from fraudai.tools.implementations import ToolImplementations
 
 if TYPE_CHECKING:
@@ -150,38 +153,238 @@ async def test_unknown_perturbation_is_rejected_before_the_sandbox(
 # ---------------------------------------------------------------------------
 
 
+SESSION_A = "11111111-1111-4111-8111-111111111111"
+SESSION_B = "22222222-2222-4222-8222-222222222222"
+
+
 @pytest.fixture()
-def uploads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    base = tmp_path / "uploads"
-    base.mkdir()
-    monkeypatch.setattr(ToolImplementations, "ALLOWED_INPUT_DIRS", [str(base)])
-    return base
+def uploads_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    root = tmp_path / "fraudai_uploads"
+    root.mkdir()
+    monkeypatch.setattr(session_context, "uploads_root", lambda: root)
+    return root
 
 
-def test_file_inside_the_allowed_directory_is_read(uploads: Path) -> None:
-    (uploads / "tx.csv").write_text("id\n1\n")
+def _session_file(root: Path, session_id: str, name: str, content: str = "id\n1\n") -> Path:
+    directory = root / session_id
+    directory.mkdir(exist_ok=True)
+    path = directory / name
+    path.write_text(content)
+    return path
 
-    data = ToolImplementations(sandbox=MagicMock())._read_input_file(str(uploads / "tx.csv"))
 
-    assert data == b"id\n1\n"
+def _read(data_path: str, *, session_id: str | None) -> bytes:
+    impls = ToolImplementations(sandbox=MagicMock())
+    if session_id is None:
+        return impls._read_input_file(data_path)
+    with bind_session(session_id):
+        return impls._read_input_file(data_path)
 
 
-def test_sibling_directory_sharing_the_prefix_is_rejected(uploads: Path) -> None:
-    sibling = uploads.parent / "uploads_evil"
+def test_file_of_the_active_session_is_read_by_absolute_path(uploads_root: Path) -> None:
+    path = _session_file(uploads_root, SESSION_A, "tx.csv")
+
+    assert _read(str(path), session_id=SESSION_A) == b"id\n1\n"
+
+
+def test_relative_name_resolves_inside_the_session_directory(uploads_root: Path) -> None:
+    _session_file(uploads_root, SESSION_A, "tx.csv")
+
+    assert _read("tx.csv", session_id=SESSION_A) == b"id\n1\n"
+
+
+def test_upload_of_another_session_is_denied(uploads_root: Path) -> None:
+    other = _session_file(uploads_root, SESSION_B, "secret.csv", "victim")
+
+    with pytest.raises(PermissionError):
+        _read(str(other), session_id=SESSION_A)
+    with pytest.raises(PermissionError):
+        _read(f"../{SESSION_B}/secret.csv", session_id=SESSION_A)
+
+
+def test_no_active_session_denies_everything(uploads_root: Path) -> None:
+    path = _session_file(uploads_root, SESSION_A, "tx.csv")
+
+    with pytest.raises(PermissionError, match="no active session"):
+        _read(str(path), session_id=None)
+
+
+def test_session_binding_does_not_leak_after_the_scope(uploads_root: Path) -> None:
+    path = _session_file(uploads_root, SESSION_A, "tx.csv")
+    _read(str(path), session_id=SESSION_A)
+
+    with pytest.raises(PermissionError):
+        _read(str(path), session_id=None)
+
+
+@pytest.mark.parametrize(
+    "bad_session", ["../etc", "not-a-uuid", "", "ABCDEF01-0000-4000-8000-000000000000"]
+)
+def test_non_canonical_active_session_id_is_denied(uploads_root: Path, bad_session: str) -> None:
+    # bind_session refuses these; force the variable to prove the reader does too.
+    token = session_context._active_session_id.set(bad_session)
+    try:
+        with pytest.raises(PermissionError):
+            ToolImplementations(sandbox=MagicMock())._read_input_file("tx.csv")
+    finally:
+        session_context._active_session_id.reset(token)
+
+
+@pytest.mark.parametrize(
+    "data_path",
+    ["../outside.csv", "../../etc/passwd", "/etc/passwd", "sub/../../outside.csv", "."],
+)
+def test_traversal_and_foreign_absolute_paths_are_denied(
+    uploads_root: Path, data_path: str
+) -> None:
+    (uploads_root / "outside.csv").write_text("x")
+    _session_file(uploads_root, SESSION_A, "tx.csv")
+
+    with pytest.raises(PermissionError):
+        _read(data_path, session_id=SESSION_A)
+
+
+def test_rest_of_the_temp_directory_is_denied(uploads_root: Path, tmp_path: Path) -> None:
+    sandbox_input = tmp_path / "other.csv"
+    sandbox_input.write_text("x")
+    _session_file(uploads_root, SESSION_A, "tx.csv")
+
+    with pytest.raises(PermissionError):
+        _read(str(sandbox_input), session_id=SESSION_A)
+
+
+def test_sibling_directory_sharing_the_prefix_is_denied(uploads_root: Path) -> None:
+    sibling = uploads_root / f"{SESSION_A}_evil"
     sibling.mkdir()
     (sibling / "secret.csv").write_text("x")
 
     with pytest.raises(PermissionError):
-        ToolImplementations(sandbox=MagicMock())._read_input_file(str(sibling / "secret.csv"))
+        _read(str(sibling / "secret.csv"), session_id=SESSION_A)
 
 
-def test_symlink_escaping_the_allowed_directory_is_rejected(uploads: Path) -> None:
-    outside = uploads.parent / "outside.csv"
+def test_symlink_escaping_the_session_directory_is_denied(uploads_root: Path) -> None:
+    outside = uploads_root / "outside.csv"
     outside.write_text("x")
-    (uploads / "link.csv").symlink_to(outside)
+    victim = _session_file(uploads_root, SESSION_B, "secret.csv", "victim")
+    directory = uploads_root / SESSION_A
+    directory.mkdir()
+    (directory / "link.csv").symlink_to(outside)
+    (directory / "peer.csv").symlink_to(victim)
 
     with pytest.raises(PermissionError):
-        ToolImplementations(sandbox=MagicMock())._read_input_file(str(uploads / "link.csv"))
+        _read("link.csv", session_id=SESSION_A)
+    with pytest.raises(PermissionError):
+        _read("peer.csv", session_id=SESSION_A)
+
+
+def test_missing_file_inside_the_session_is_not_found(uploads_root: Path) -> None:
+    (uploads_root / SESSION_A).mkdir()
+
+    with pytest.raises(FileNotFoundError):
+        _read("nope.csv", session_id=SESSION_A)
+
+
+def test_session_directory_itself_is_not_readable(uploads_root: Path) -> None:
+    (uploads_root / SESSION_A).mkdir()
+
+    with pytest.raises(PermissionError):
+        _read(str(uploads_root / SESSION_A), session_id=SESSION_A)
+
+
+# ---------------------------------------------------------------------------
+# Session binding lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_binding_is_restored_after_an_error() -> None:
+    with pytest.raises(RuntimeError), bind_session(SESSION_A):
+        assert active_session_id() == SESSION_A
+        raise RuntimeError("boom")
+
+    assert active_session_id() is None
+
+
+def test_nested_binding_restores_the_outer_session() -> None:
+    with bind_session(SESSION_A):
+        with bind_session(SESSION_B):
+            assert active_session_id() == SESSION_B
+        assert active_session_id() == SESSION_A
+
+
+@pytest.mark.parametrize("bad", ["", "../x", "not-a-uuid", "ABCDEF01-0000-4000-8000-000000000000"])
+def test_binding_refuses_non_canonical_session_ids(bad: str) -> None:
+    with pytest.raises(ValueError, match="invalid session id"), bind_session(bad):
+        pass
+
+    assert active_session_id() is None
+
+
+async def test_concurrent_requests_do_not_see_each_others_session() -> None:
+    both_bound = asyncio.Event()
+    waiting = 0
+    seen: dict[str, list[str | None]] = {}
+
+    async def request(session_id: str) -> None:
+        nonlocal waiting
+        with bind_session(session_id):
+            seen[session_id] = [active_session_id()]
+            waiting += 1
+            if waiting == 2:
+                both_bound.set()
+            await both_bound.wait()  # both sessions are bound at the same time here
+            await asyncio.sleep(0)
+            seen[session_id].append(active_session_id())
+
+    await asyncio.gather(request(SESSION_A), request(SESSION_B))
+
+    assert seen == {SESSION_A: [SESSION_A, SESSION_A], SESSION_B: [SESSION_B, SESSION_B]}
+    assert active_session_id() is None
+
+
+async def test_cancelled_request_does_not_leak_its_binding() -> None:
+    entered = asyncio.Event()
+
+    async def request() -> None:
+        with bind_session(SESSION_A):
+            entered.set()
+            await asyncio.sleep(60)
+
+    task = asyncio.create_task(request())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert active_session_id() is None
+
+
+# ---------------------------------------------------------------------------
+# Environment is a closed set (M5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "environment",
+    ["prod", "PRODUCTION", "Production", "production ", "test", "", "dev"],
+)
+def test_unknown_environment_fails_closed(environment: str) -> None:
+    with pytest.raises(ValidationError, match="environment"):
+        Settings(_env_file=None, environment=environment)
+
+
+@pytest.mark.parametrize("environment", ["development", "staging", "production"])
+def test_known_environments_are_accepted(environment: str) -> None:
+    assert (
+        Settings(_env_file=None, environment=environment, jwt_secret="k" * 48).environment
+        == environment
+    )
+
+
+def test_environment_from_the_process_env_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "prod")
+
+    with pytest.raises(ValidationError, match="environment"):
+        Settings(_env_file=None)
 
 
 # ---------------------------------------------------------------------------

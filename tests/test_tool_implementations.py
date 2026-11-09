@@ -8,10 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from fraudai.core.session_context import bind_session
 from fraudai.tools.implementations import ToolImplementations
 from fraudai.tools.sandbox import SandboxResult
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 
@@ -91,6 +93,22 @@ def _public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ToolImplementations, "_resolve_host", staticmethod(lambda _host: ["93.184.216.34"])
     )
+
+
+_ACTIVE_SESSION = "44444444-4444-4444-8444-444444444444"
+
+
+@pytest.fixture(autouse=True)
+def _session_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run every test inside a valid session whose upload folder is ``tmp_path``.
+
+    Tools only read files of the active session (M6); the tests keep their
+    fixtures in ``tmp_path`` by making it the session's upload folder. Tests
+    that need other bindings (none, or a different folder) use their own scope.
+    """
+    monkeypatch.setattr("fraudai.tools.implementations.upload_dir", lambda _sid: tmp_path)
+    with bind_session(_ACTIVE_SESSION):
+        yield
 
 
 @pytest.fixture()
@@ -174,11 +192,7 @@ class TestAnalyzeTransactions:
 
     async def test_file_not_found(self, tool_impls: ToolImplementations) -> None:
         """analyze_transactions should return error dict for missing file."""
-        import tempfile
-        from pathlib import Path as _Path
-
-        fake_path = str(_Path(tempfile.gettempdir()) / "nonexistent_file.csv")
-        result = await tool_impls.analyze_transactions(fake_path)
+        result = await tool_impls.analyze_transactions("nonexistent_file.csv")
 
         assert result["status"] == "failed"
         assert "not found" in result["error"].lower()
@@ -986,3 +1000,43 @@ class TestConstructor:
         )
 
         assert impls._sandbox_networked is mock_sandbox_networked
+
+
+# ---------------------------------------------------------------------------
+# Tests: input files are confined to the active session (M6)
+# ---------------------------------------------------------------------------
+
+
+class TestInputFileConfinement:
+    """The autouse session scope must not weaken the fail-closed rules."""
+
+    async def test_path_outside_the_session_folder_is_denied(
+        self, tool_impls: ToolImplementations, tmp_path: Path
+    ) -> None:
+        outside = tmp_path.parent / "outside.csv"
+        outside.write_text("id\n1\n")
+
+        with pytest.raises(PermissionError):
+            await tool_impls.analyze_transactions(str(outside))
+
+    async def test_traversal_out_of_the_session_folder_is_denied(
+        self, tool_impls: ToolImplementations, tmp_path: Path
+    ) -> None:
+        (tmp_path.parent / "outside.csv").write_text("id\n1\n")
+
+        with pytest.raises(PermissionError):
+            await tool_impls.risk_scoring("../outside.csv")
+
+    async def test_no_active_session_is_denied_even_for_an_existing_file(
+        self, tool_impls: ToolImplementations, sample_csv: Path, mock_sandbox: MagicMock
+    ) -> None:
+        from fraudai.core import session_context
+
+        token = session_context._active_session_id.set(None)
+        try:
+            with pytest.raises(PermissionError, match="no active session"):
+                await tool_impls.analyze_transactions(str(sample_csv))
+        finally:
+            session_context._active_session_id.reset(token)
+
+        mock_sandbox.execute_python.assert_not_called()
