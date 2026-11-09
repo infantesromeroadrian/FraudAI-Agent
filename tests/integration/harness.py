@@ -10,21 +10,28 @@ a path that is allowed to reach the service, must produce hits first.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
+from unittest import mock
 
 import docker
 import docker.errors
+import docker.models.containers
+import docker.models.networks
 
+from fraudai.tools import sandbox as sandbox_module
 from fraudai.tools.egress import EgressPolicy, EgressTarget
 from fraudai.tools.sandbox import SandboxEngine, SandboxResult
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Callable, Coroutine, Iterator
 
     from docker.models.containers import Container
 
@@ -126,6 +133,27 @@ while True:
     conn, addr = server.accept()
     print("ACCEPT", addr[0], flush=True)
     threading.Thread(target=handle, args=(conn, addr[0]), daemon=True).start()
+"""
+
+# Synthetic DNS upstream: answers every A query with a documentation address and logs
+# ``QUERY <name> <client>`` so a test can count what actually reached it.
+DNS_SERVICE_SOURCE = """\
+import socket, sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", int(sys.argv[1])))
+print("READY", flush=True)
+while True:
+    data, peer = sock.recvfrom(512)
+    labels, index = [], 12
+    while index < len(data) and data[index]:
+        labels.append(data[index + 1 : index + 1 + data[index]].decode(errors="replace"))
+        index += data[index] + 1
+    question = data[12 : index + 5]
+    print("QUERY", ".".join(labels), peer[0], flush=True)
+    head = data[:2] + b"\\x81\\x80" + data[4:6] + b"\\x00\\x01\\x00\\x00\\x00\\x00"
+    pointer = b"\\xc0\\x0c\\x00\\x01\\x00\\x01\\x00\\x00\\x00\\x3c\\x00\\x04"
+    sock.sendto(head + question + pointer + bytes([203, 0, 113, 9]), peer)
 """
 
 # Connects to every target and reports what happened. Run from a control
@@ -258,6 +286,14 @@ class SyntheticService:
         """TCP connections accepted so far (a probe's mere connect counts)."""
         return sum(1 for line in self.log_lines() if line.startswith("ACCEPT"))
 
+    def queries(self, name: str | None = None) -> int:
+        """DNS queries received so far (DNS service only), optionally for one name."""
+        return sum(
+            1
+            for line in self.log_lines()
+            if line.startswith("QUERY") and (name is None or line.split()[1] == name)
+        )
+
     def hits(self, label: str | None = None) -> int:
         """HTTP requests received so far, optionally only those with ``Host: label``."""
         return sum(
@@ -279,9 +315,10 @@ def start_service(  # noqa: PLR0913 - explicit fixture knobs, all keyword-only
     network_mode: str | None = None,
     low_ports: bool = False,
     ipv4_address: str | None = None,
+    source: str = SERVICE_SOURCE,
 ) -> SyntheticService:
     """Start a synthetic service and wait until it logs READY."""
-    command = ["python", "-c", SERVICE_SOURCE, str(port), mode, location]
+    command = ["python", "-c", source, str(port), mode, location]
     name = f"fraudai-it-{session}-{secrets.token_hex(3)}"
     environment = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
     sysctls = {"net.ipv4.ip_unprivileged_port_start": "0"} if low_ports else None
@@ -366,14 +403,21 @@ def start_host_namespace_service(
     raise RuntimeError(msg) from last_error
 
 
-def run_control(
-    client: docker.DockerClient, image: str, code: str, *, session: str, network: str
+def run_control(  # noqa: PLR0913 - explicit keyword-only knobs
+    client: docker.DockerClient,
+    image: str,
+    code: str,
+    *,
+    session: str,
+    network: str,
+    dns: list[str] | None = None,
 ) -> str:
     """Run *code* in a plain (non-sandbox) container on *network*; return stdout."""
     container = client.containers.run(
         image,
         ["python", "-c", code],
         network=network,
+        dns=dns,
         detach=True,
         labels={IT_LABEL: session},
         read_only=True,
@@ -499,3 +543,201 @@ class NetworkEvidence:
     after_controls: Counters
     after_none: Counters
     after_egress: Counters
+
+
+# --- lifecycle instrumentation -------------------------------------------------------
+BLOCK_TIMEOUT_SECONDS = 60.0
+WRITER_TIMEOUT_SECONDS = 30.0
+_ENGINE_SLOT_BY_ROLE = {"sandbox": "sandbox", "egress-proxy": "proxy"}
+
+
+def _is_sandbox_container(container: Any) -> bool:
+    name = str(container.name)
+    return name.startswith("fraudai-sbx-") and name.endswith("-run")
+
+
+class LifecycleProbe:
+    """Pass-through instrumentation of the Docker SDK calls the engine makes.
+
+    Nothing is faked: every call still reaches the real daemon. The probe can
+    (a) hold one engine ``create`` (network, proxy or sandbox) at a deterministic
+    point with events instead of sleeps, (b) make selected ``Container`` methods of
+    the *sandbox* container raise, and (c) record which resources the engine
+    created and what state the sandbox was in when its outputs were read.
+
+    It patches the SDK classes, not instances: ``DockerClient.networks`` returns a
+    new collection on every access, so instance patches would silently not apply.
+    Every id it saw is force-removed on exit, so a failing test cannot leak.
+    """
+
+    def __init__(self, client: docker.DockerClient) -> None:
+        self.client = client
+        self.block_slot: str | None = None
+        self.entered = threading.Event()  # the held create has started
+        self.release = threading.Event()  # let the held create proceed
+        self.finished = threading.Event()  # the held create returned a resource
+        self.networks: list[str] = []
+        self.containers: dict[str, list[str]] = {"sandbox": [], "proxy": []}
+        self.fail_methods: dict[str, int] = {}  # method -> failures left (-1: always)
+        self.wait_for_writer = False
+        self.reads: list[list[str]] = []  # sandbox states at each read_output_tree call
+        self.on_container_create: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
+        self.on_network_create: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        self.before_network_remove: Callable[[Any], None] | None = None
+        self._patches = contextlib.ExitStack()
+
+    # -- patches ------------------------------------------------------------------
+    def __enter__(self) -> LifecycleProbe:
+        containers = docker.models.containers
+        networks = docker.models.networks
+        original_net_create = networks.NetworkCollection.create
+        original_ctr_create = containers.ContainerCollection.create
+        original_net_remove = networks.Network.remove
+        original_read = sandbox_module.read_output_tree
+
+        def net_create(coll: Any, *args: Any, **kwargs: Any) -> Any:
+            engine_owned = (kwargs.get("labels") or {}).get(SANDBOX_LABEL) == "1"
+            held = engine_owned and self._hold("network")
+            if engine_owned and self.on_network_create is not None:
+                kwargs = self.on_network_create(kwargs)
+            network = original_net_create(coll, *args, **kwargs)
+            if engine_owned:
+                self.networks.append(str(network.id))
+            if held:
+                self.finished.set()
+            return network
+
+        def ctr_create(coll: Any, *args: Any, **kwargs: Any) -> Any:
+            role = (kwargs.get("labels") or {}).get("role")
+            slot = _ENGINE_SLOT_BY_ROLE.get(str(role))
+            held = slot is not None and self._hold(slot)
+            if slot is not None and self.on_container_create is not None:
+                kwargs = self.on_container_create(slot, kwargs)
+            container = original_ctr_create(coll, *args, **kwargs)
+            if slot is not None:
+                self.containers[slot].append(str(container.id))
+            if held:
+                self.finished.set()
+            return container
+
+        def net_remove(network: Any, *args: Any, **kwargs: Any) -> Any:
+            if self.before_network_remove is not None:
+                self.before_network_remove(network)
+            return original_net_remove(network, *args, **kwargs)
+
+        def read_tree(root: Any, caps: Any) -> Any:
+            states = []
+            for container_id in self.containers["sandbox"]:
+                try:
+                    states.append(str(self.client.containers.get(container_id).status))
+                except docker.errors.NotFound:
+                    states.append("gone")
+            self.reads.append(states)
+            return original_read(root, caps)
+
+        self._patches.enter_context(
+            mock.patch.object(networks.NetworkCollection, "create", net_create)
+        )
+        self._patches.enter_context(
+            mock.patch.object(containers.ContainerCollection, "create", ctr_create)
+        )
+        self._patches.enter_context(mock.patch.object(networks.Network, "remove", net_remove))
+        self._patches.enter_context(
+            mock.patch.object(sandbox_module, "read_output_tree", read_tree)
+        )
+        for method in ("wait", "stop", "kill", "remove"):
+            self._patches.enter_context(
+                mock.patch.object(
+                    containers.Container,
+                    method,
+                    self._failing(method, getattr(containers.Container, method)),
+                )
+            )
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release.set()  # never leave a worker thread parked
+        self._patches.close()
+        for container_id in [*self.containers["sandbox"], *self.containers["proxy"]]:
+            with contextlib.suppress(docker.errors.NotFound, docker.errors.APIError):
+                self.client.containers.get(container_id).remove(force=True)
+        for network_id in self.networks:
+            with contextlib.suppress(docker.errors.NotFound, docker.errors.APIError):
+                self.client.networks.get(network_id).remove()
+
+    # -- helpers --------------------------------------------------------------------
+    def _hold(self, slot: str) -> bool:
+        if slot != self.block_slot:
+            return False
+        self.entered.set()
+        if not self.release.wait(timeout=BLOCK_TIMEOUT_SECONDS):
+            msg = f"probe was never released while holding the {slot} create"
+            raise RuntimeError(msg)
+        return True
+
+    def _failing(self, method: str, original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(container: Any, *args: Any, **kwargs: Any) -> Any:
+            left = self.fail_methods.get(method, 0)
+            if left != 0 and _is_sandbox_container(container):
+                if method == "wait" and self.wait_for_writer:
+                    self._await_writer(container)
+                if left > 0:
+                    self.fail_methods[method] = left - 1
+                msg = f"injected {method} failure"
+                raise RuntimeError(msg)
+            return original(container, *args, **kwargs)
+
+        return wrapper
+
+    @staticmethod
+    def _await_writer(container: Any) -> None:
+        """Block until the sandbox process has written a tick (a condition, not a sleep)."""
+        source = next(
+            m["Source"]
+            for m in container.attrs["Mounts"]
+            if m["Destination"] == "/workspace/output"
+        )
+        tick = Path(source) / "tick.txt"
+        deadline = time.monotonic() + WRITER_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if tick.exists() and tick.stat().st_size > 0:
+                return
+            time.sleep(0.02)
+        msg = "the sandbox writer never produced output"
+        raise RuntimeError(msg)
+
+
+@contextlib.contextmanager
+def dns_upstream_in_engine_network(
+    probe: LifecycleProbe, dns: SyntheticService, *, offer: bool
+) -> Iterator[None]:
+    """Make *dns* reachable on the engine's per-run network.
+
+    With ``offer=True`` the sandbox is also *configured* to use it as its upstream
+    (a mutation of the engine's ``dns`` pin, used as a positive control). The DNS
+    container is detached just before the engine removes the network.
+    """
+    attached: list[str] = []
+
+    def on_create(slot: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if slot != "sandbox":
+            return kwargs
+        network = probe.client.networks.get(kwargs["network"])
+        network.connect(dns.container)
+        attached.append(str(network.name))
+        if offer:
+            return {**kwargs, "dns": [dns.address(str(network.name))]}
+        return kwargs
+
+    def before_remove(network: Any) -> None:
+        if network.name in attached:
+            with contextlib.suppress(docker.errors.APIError):
+                network.disconnect(dns.container, force=True)
+
+    probe.on_container_create = on_create
+    probe.before_network_remove = before_remove
+    try:
+        yield
+    finally:
+        probe.on_container_create = None
+        probe.before_network_remove = None
