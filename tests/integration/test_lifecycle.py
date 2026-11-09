@@ -173,6 +173,51 @@ def test_unconfirmed_removal_discards_outputs_and_propagates_the_error(
     assert sandbox_resources(docker_env.client) == before
 
 
+LOGGING_WRITER_CODE = 'print("writer-started", flush=True)\n' + WRITER_CODE
+
+
+def test_exited_container_whose_removal_errored_is_removed_again_by_the_final_cleanup(
+    docker_env: DockerEnv,
+) -> None:
+    """Residual CX1: the daemon stopped the writer but ``remove`` raised anyway.
+
+    The container then exists in state ``exited`` -- not ``NotFound`` -- so the
+    engine may read its outputs but must still remove it at the end. Treating
+    "stopped" as "gone" skipped that second removal and left it behind.
+    """
+    client = docker_env.client
+    before = sandbox_resources(client)
+    engine = SandboxEngine(
+        docker_client=client, image=docker_env.image, timeout=STEP_TIMEOUT_SECONDS
+    )
+
+    with LifecycleProbe(client) as probe:
+        probe.wait_for_writer = True
+        probe.fail_methods = {"wait": -1, "stop": -1, "kill": -1}
+        probe.remove_stops_then_fails = 1
+
+        async def scenario() -> tuple[SandboxResult, list[Any]]:
+            result = await engine.execute_python(LOGGING_WRITER_CODE)
+            return result, [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+        result, orphan_tasks = run_async(scenario())
+
+        sandbox_id = probe.containers["sandbox"][0]
+        assert result.timed_out is True
+        assert probe.state_after_failed_remove == "exited"  # stopped, yet still present
+        assert probe.remove_calls == 2, "the final cleanup must remove it a second time"
+        # stopped (not NotFound): outputs and logs were read from the exited container,
+        # unlike the force-removed case where its logs left with it
+        assert probe.reads == [["exited"]]
+        assert "writer-started" in result.stdout
+        assert int(result.output_files["tick.txt"]) >= 0
+        # absence is confirmed before the run is over, by the engine and not by the probe's
+        # own cleanup (which only runs when this block exits)
+        assert not _exists(client, "container", sandbox_id)
+        assert orphan_tasks == []
+    assert sandbox_resources(client) == before
+
+
 # --- output flood and timeout ceiling, measured on the real bind mount ----------------------
 
 

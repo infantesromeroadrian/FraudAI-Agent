@@ -580,6 +580,11 @@ class LifecycleProbe:
         self.containers: dict[str, list[str]] = {"sandbox": [], "proxy": []}
         self.fail_methods: dict[str, int] = {}  # method -> failures left (-1: always)
         self.wait_for_writer = False
+        # The next N sandbox ``remove`` calls really stop the container, then raise: the
+        # daemon did the work but the client saw an error (the residual CX1 scenario).
+        self.remove_stops_then_fails = 0
+        self.remove_calls = 0  # every ``remove`` the engine attempted on the sandbox
+        self.state_after_failed_remove: str | None = None
         self.reads: list[list[str]] = []  # sandbox states at each read_output_tree call
         self.on_container_create: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
         self.on_network_create: Callable[[dict[str, Any]], dict[str, Any]] | None = None
@@ -677,6 +682,13 @@ class LifecycleProbe:
 
     def _failing(self, method: str, original: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(container: Any, *args: Any, **kwargs: Any) -> Any:
+            if method == "remove" and _is_sandbox_container(container):
+                self.remove_calls += 1
+                if self.remove_stops_then_fails > 0:
+                    self.remove_stops_then_fails -= 1
+                    self.state_after_failed_remove = self._really_stop(container)
+                    msg = "injected remove failure after the container stopped"
+                    raise RuntimeError(msg)
             left = self.fail_methods.get(method, 0)
             if left != 0 and _is_sandbox_container(container):
                 if method == "wait" and self.wait_for_writer:
@@ -688,6 +700,23 @@ class LifecycleProbe:
             return original(container, *args, **kwargs)
 
         return wrapper
+
+    def _really_stop(self, container: Any) -> str:
+        """Kill the container through the low-level API (not patched) and wait until it exited.
+
+        Returns the status the daemon reports, which proves the container still
+        exists in that state. A bounded condition wait, not a sleep.
+        """
+        with contextlib.suppress(docker.errors.APIError):
+            self.client.api.kill(container.id)
+        deadline = time.monotonic() + WRITER_TIMEOUT_SECONDS
+        status = "unknown"
+        while time.monotonic() < deadline:
+            status = str(self.client.api.inspect_container(container.id)["State"]["Status"])
+            if status in ("exited", "dead"):
+                break
+            time.sleep(0.02)
+        return status
 
     @staticmethod
     def _await_writer(container: Any) -> None:
