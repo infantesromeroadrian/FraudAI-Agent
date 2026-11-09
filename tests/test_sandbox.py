@@ -1230,3 +1230,93 @@ class TestResolverIsPinnedInert:
         await engine.execute_python("pass")
 
         assert "dns" not in mock_docker_client.containers.create.call_args.kwargs
+
+
+class TestForcedRemovalThatLeavesAStoppedContainer:
+    """Residual CX1: ``exited`` is not ``gone``; the final removal must still happen."""
+
+    @staticmethod
+    def _stateful(mock_container: MagicMock) -> dict[str, Any]:
+        import docker.errors
+
+        state: dict[str, Any] = {"status": "running", "exists": True, "remove_calls": 0}
+
+        def stop(timeout: int = 10) -> None:
+            raise RuntimeError("stop failed")
+
+        def kill() -> None:
+            raise RuntimeError("kill failed")
+
+        def reload() -> None:
+            if not state["exists"]:
+                raise docker.errors.NotFound("gone")
+
+        mock_container.wait.side_effect = TimeoutError("wait failed")
+        mock_container.stop.side_effect = stop
+        mock_container.kill.side_effect = kill
+        mock_container.reload.side_effect = reload
+        type(mock_container).status = property(lambda _self: state["status"])
+        return state
+
+    async def test_exited_container_whose_removal_errored_is_removed_again(
+        self,
+        engine: SandboxEngine,
+        mock_docker_client: MagicMock,
+        mock_container: MagicMock,
+    ) -> None:
+        state = self._stateful(mock_container)
+
+        def remove(force: bool = False) -> None:
+            state["remove_calls"] += 1
+            if state["remove_calls"] == 1:
+                state["status"] = "exited"  # the daemon killed it, then reported an error
+                raise RuntimeError("removal reported an error")
+            state["exists"] = False
+
+        mock_container.remove.side_effect = remove
+        mock_docker_client.containers.create.return_value = mock_container
+
+        result = await engine.execute_python("pass")
+
+        assert result.timed_out is True  # stopped: the writer is gone, outputs may be read
+        assert state["exists"] is False, "an exited container was left behind"
+        assert state["remove_calls"] == 2
+
+    async def test_really_removed_container_is_not_removed_a_second_time(
+        self,
+        engine: SandboxEngine,
+        mock_docker_client: MagicMock,
+        mock_container: MagicMock,
+    ) -> None:
+        state = self._stateful(mock_container)
+
+        def remove(force: bool = False) -> None:
+            state["remove_calls"] += 1
+            state["exists"] = False
+
+        mock_container.remove.side_effect = remove
+        mock_docker_client.containers.create.return_value = mock_container
+
+        result = await engine.execute_python("pass")
+
+        assert result.timed_out is True
+        assert state["remove_calls"] == 1  # NotFound confirmed the absence
+
+    async def test_unknown_state_after_removal_failure_discards_outputs(
+        self,
+        engine: SandboxEngine,
+        mock_docker_client: MagicMock,
+        mock_container: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._stateful(mock_container)
+        mock_container.reload.side_effect = RuntimeError("daemon unreachable")
+        mock_container.remove.side_effect = RuntimeError("remove failed")
+        mock_docker_client.containers.create.return_value = mock_container
+        reads: list[object] = []
+        monkeypatch.setattr("fraudai.tools.sandbox.read_output_tree", lambda *a: reads.append(a))
+
+        with pytest.raises(SandboxError, match="outputs were discarded"):
+            await engine.execute_python("pass")
+
+        assert reads == []

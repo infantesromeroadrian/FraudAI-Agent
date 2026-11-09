@@ -720,23 +720,30 @@ class SandboxEngine:
             if cancelled:
                 raise asyncio.CancelledError
 
-    async def _container_is_stopped(self, container: Container) -> bool:
-        """True when Docker reports the container exited, dead or already removed."""
+    async def _container_state(self, container: Container) -> str:
+        """Inspect the container: ``"gone"`` (confirmed absent), ``"stopped"`` or ``"alive"``.
+
+        ``"stopped"`` means it still exists but has exited or died, so it still
+        needs its final removal. ``"alive"`` covers running *and* any state we
+        cannot establish (inspect failed, unexpected status): both must be treated
+        as a possible writer.
+        """
         try:
             await asyncio.to_thread(container.reload)
         except docker.errors.NotFound:
-            return True
+            return "gone"
         except Exception:
             logger.exception("Could not inspect sandbox container %s", container.short_id)
-            return False
-        return bool(container.status in ("exited", "dead"))
+            return "alive"
+        return "stopped" if container.status in ("exited", "dead") else "alive"
 
     async def _ensure_stopped(self, container: Container, resources: _RunResources) -> str:
         """Make sure the sandbox can no longer write; return how that was established.
 
         Graceful stop, then kill, then forced removal; each step is verified with
-        an inspect. ``"stopped"``: exited; ``"removed"``: had to be force-removed
-        and is gone; ``"unconfirmed"``: still possibly alive (outputs must not be read).
+        an inspect. ``"stopped"``: exited but still present (the final cleanup removes
+        it); ``"removed"``: confirmed absent (``NotFound``), nothing left to remove;
+        ``"unconfirmed"``: still possibly alive (outputs must not be read).
         """
         for step, action in (
             ("stop", lambda: container.stop(timeout=5)),
@@ -746,16 +753,23 @@ class SandboxEngine:
                 await asyncio.to_thread(action)
             except Exception:
                 logger.warning("Sandbox container %s: %s failed", container.short_id, step)
-            if await self._container_is_stopped(container):
-                return "stopped"
+            state = await self._container_state(container)
+            if state != "alive":
+                return self._settle(state, resources)
         try:
             await asyncio.to_thread(container.remove, force=True)
         except Exception:
             logger.exception("Forced removal of sandbox container %s failed", container.short_id)
-        if await self._container_is_stopped(container):
+        state = await self._container_state(container)
+        return "unconfirmed" if state == "alive" else self._settle(state, resources)
+
+    @staticmethod
+    def _settle(state: str, resources: _RunResources) -> str:
+        """Map a non-alive state to the result; only a confirmed absence skips the final removal."""
+        if state == "gone":
             resources.container_gone = True
             return "removed"
-        return "unconfirmed"
+        return "stopped"
 
     async def _read_logs(self, container: Container, *, stdout: bool) -> bytes:
         data: bytes = await asyncio.to_thread(container.logs, stdout=stdout, stderr=not stdout)
