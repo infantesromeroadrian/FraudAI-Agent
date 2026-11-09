@@ -48,7 +48,9 @@ class TestCreateApp:
         from fraudai.api.app import create_app
 
         app = create_app()
-        route_paths = [r.path for r in app.routes]
+        # Read paths from the OpenAPI schema: app.routes holds router objects
+        # without a ``path`` attribute in recent FastAPI releases.
+        route_paths = list(app.openapi()["paths"])
         # At minimum, the /api/v1 prefix should be present via router
         assert any("/api/v1" in p for p in route_paths)
 
