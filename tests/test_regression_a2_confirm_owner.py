@@ -6,8 +6,9 @@ the session (``action_id`` is ignored too; binding it is scheduled for F4 and
 is out of scope here). A different tenant can therefore approve, and trigger,
 the victim's pending red-teaming action.
 
-This test is RED on purpose until ownership is enforced (expected: 403/404 and
-the victim's interrupt stays pending). Real pieces: JWT auth,
+This test was shown red on baseline 6135401 (before ownership was enforced)
+and must stay green now that it is (expected: 403/404 and the victim's interrupt
+stays pending). Real pieces: JWT auth,
 ``SessionManager``, ``/chat`` + ``/confirm`` routes, compiled graph with its
 ``MemorySaver`` and the real ``ClaudeAgentInvoker``. Donna and the chat model
 at the provider edge are deterministic stubs; the model plans an

@@ -388,23 +388,46 @@ def test_environment_from_the_process_env_is_validated(monkeypatch: pytest.Monke
 
 
 # ---------------------------------------------------------------------------
-# JWT secret in production
+# JWT secret outside development (staging and production)
 # ---------------------------------------------------------------------------
 
+SECRET_REQUIRED_ENVIRONMENTS = ["staging", "production"]
 
+
+@pytest.mark.parametrize("environment", SECRET_REQUIRED_ENVIRONMENTS)
 @pytest.mark.parametrize(
     "secret",
     ["fraudai-dev-secret-change-in-production", "change-this-in-production", "short"],
 )
-def test_production_refuses_placeholder_or_short_jwt_secret(secret: str) -> None:
+def test_non_development_refuses_placeholder_or_short_jwt_secret(
+    environment: str, secret: str
+) -> None:
     with pytest.raises(ValidationError, match="JWT_SECRET"):
-        Settings(_env_file=None, environment="production", jwt_secret=secret)
+        Settings(_env_file=None, environment=environment, jwt_secret=secret)
 
 
-def test_production_accepts_a_long_random_jwt_secret() -> None:
-    settings = Settings(_env_file=None, environment="production", jwt_secret="k" * 48)
+@pytest.mark.parametrize("environment", SECRET_REQUIRED_ENVIRONMENTS)
+def test_non_development_refuses_the_built_in_default_secret(
+    environment: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("JWT_SECRET", raising=False)
 
-    assert settings.environment == "production"
+    with pytest.raises(ValidationError, match="JWT_SECRET"):
+        Settings(_env_file=None, environment=environment)
+
+
+@pytest.mark.parametrize("environment", SECRET_REQUIRED_ENVIRONMENTS)
+def test_non_development_error_names_the_environment(environment: str) -> None:
+    with pytest.raises(ValidationError, match=f"ENVIRONMENT={environment}"):
+        Settings(_env_file=None, environment=environment, jwt_secret="short")
+
+
+@pytest.mark.parametrize("environment", SECRET_REQUIRED_ENVIRONMENTS)
+def test_non_development_accepts_a_long_random_jwt_secret(environment: str) -> None:
+    settings = Settings(_env_file=None, environment=environment, jwt_secret="k" * 48)
+
+    assert settings.environment == environment
+    assert settings.jwt_secret == "k" * 48
 
 
 def test_development_keeps_the_default_secret_for_local_use() -> None:

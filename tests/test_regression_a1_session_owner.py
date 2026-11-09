@@ -4,7 +4,8 @@ Audit finding: ``routes.chat`` accepts any client-supplied ``session_id`` and
 uses it as the LangGraph ``thread_id`` without checking who owns it, so a
 second tenant reads and extends the victim's checkpointed conversation.
 
-This test is RED on purpose until ownership is enforced (expected: 403/404).
+This test was shown red on baseline 6135401 (before ownership was enforced)
+and must stay green now that it is (expected: 403/404).
 Real pieces under test: JWT auth, ``SessionManager``, the ``/chat`` route and
 the compiled graph with its ``MemorySaver`` checkpointer. Only the Donna
 classifier and the LLM invoker are replaced by deterministic stubs.
