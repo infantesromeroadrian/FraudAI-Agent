@@ -17,7 +17,8 @@
 #     tools (including the offensive ones) answer with an explicit sandbox_disabled
 #     error (ADR-007, D4-B). Never mount the Docker socket here.
 #   * Secrets live only in the local .env (never in tracked files or extra token files);
-#     the scripts hand .env to Compose with --env-file. Required variables fail fast:
+#     the scripts hand .env to Compose with --env-file. Compose `secrets` are NOT used:
+#     they cannot be attached to the read_only API service. Required variables fail fast:
 #     `docker compose` aborts when they are unset.
 # =============================================================================
 
@@ -58,6 +59,10 @@ services:
       - LLM_INPUT_COST_PER_MTOK_USD
       - LLM_OUTPUT_COST_PER_MTOK_USD
       - READINESS_INTERVAL_SECONDS
+      # The stable, metrics-only scrape credential (F5c: accepted on /admin/metrics only).
+      # Passed from .env as a variable because Compose `secrets` cannot be attached to a
+      # read_only service; Prometheus receives the same variable (see its entrypoint).
+      - METRICS_SCRAPE_TOKEN
       - LOG_LEVEL
       - LOG_FORMAT
       # Container-to-container wiring
@@ -66,10 +71,8 @@ services:
       - QDRANT_GRPC_PORT=6334
       # D2: the host's Ollama daemon (already authenticated for cloud models).
       - OLLAMA_HOST=${OLLAMA_HOST_FROM_CONTAINER:-http://host.docker.internal:11434}
-      # F5c contract: SQLite lives on the writable named volume below; the API reads the
-      # scrape credential from the shared secret file (never from an env value).
+      # F5c contract: SQLite lives on the writable named volume below.
       - DATABASE_PATH=/app/data/fraudai.db
-      - METRICS_SCRAPE_TOKEN_FILE=/run/secrets/fraudai_metrics_token
       # The browser origin of the frontend must be allowed by CORS.
       - CORS_ALLOWED_ORIGINS=http://localhost:${FRONTEND_PORT:-3000},http://127.0.0.1:${FRONTEND_PORT:-3000}
       # BUILD_SHA is baked into the image (Dockerfile) and deliberately NOT set here.
@@ -88,8 +91,6 @@ services:
       - fraudai_data:/app/data
       - hf_cache:/home/fraudai/.cache/huggingface
     restart: unless-stopped
-    secrets:
-      - fraudai_metrics_token
     healthcheck:
       # Liveness only; readiness (/api/v1/readyz) is verified by scripts/deploy.sh.
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/livez"]
@@ -194,13 +195,18 @@ services:
       # Single files/dirs, not the whole /etc/prometheus: a read-only bind of the parent
       # cannot host the nested rules mount (the mountpoint cannot be created).
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/entrypoint.sh:/etc/prometheus/entrypoint.sh:ro
       - ./monitoring/alerts:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     # The same dedicated, non-expiring, metrics-only credential the API accepts on
-    # /api/v1/admin/metrics (F5c): one secret mounted in both services (a stable token,
-    # not a JWT, so it does not expire).
-    secrets:
-      - fraudai_metrics_token
+    # /api/v1/admin/metrics (F5c; a stable token, not a JWT), delivered from .env as the
+    # variable below. The static entrypoint writes it to the private tmpfs and unsets it
+    # before exec, so Prometheus' own environment does not contain it.
+    entrypoint: ["/bin/sh", "/etc/prometheus/entrypoint.sh"]
+    environment:
+      METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:?METRICS_SCRAPE_TOKEN must be set in .env (32+ random characters)}
+    tmpfs:
+      - /run/prometheus-credentials:mode=0700,uid=65534,gid=65534,size=64k,noexec,nosuid
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -255,14 +261,6 @@ services:
           memory: 128m
     security_opt:
       - no-new-privileges:true
-
-secrets:
-  fraudai_metrics_token:
-    # The value comes from METRICS_SCRAPE_TOKEN in the local .env (the only persistent
-    # place for secrets); Compose hands it to the two services granted this secret as a
-    # file under /run/secrets, so no token file is ever kept in the repository tree.
-    # The scripts pass .env through --env-file. Compose aborts if the variable is unset.
-    environment: METRICS_SCRAPE_TOKEN
 
 volumes:
   qdrant_data:
