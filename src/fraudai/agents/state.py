@@ -12,6 +12,8 @@ from langchain_core.messages import BaseMessage  # noqa: TC002 — runtime use b
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
 
+from fraudai.agents.hitl import ActionProposal  # noqa: TC001 — runtime use by LangGraph type hints
+
 
 class AgentState(TypedDict):
     """Global state shared across all graph nodes.
@@ -47,8 +49,12 @@ class AgentState(TypedDict):
     # Escalation request: current agent asks for cross-domain collaboration
     escalation_request: dict[str, Any] | None
 
-    # Human-in-the-loop flag (Mike red teaming)
+    # Legacy flag, no longer read: HITL state lives in ``proposed_actions``.
     needs_human_confirmation: bool
+
+    # Tool calls planned by an approval-gated agent in the current turn, frozen
+    # (id, arguments, target) before the graph pauses for a human decision.
+    proposed_actions: list[ActionProposal]
 
     # Detected session language
     language: Literal["es", "en"]

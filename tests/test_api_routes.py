@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import uuid
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -72,11 +73,30 @@ def _mock_graph_state(**overrides: Any) -> dict[str, Any]:
     return state
 
 
+def _snapshot(pending: dict[str, Any] | None = None) -> SimpleNamespace:
+    """Checkpoint stand-in: paused on ``pending`` (an interrupt value) or not paused."""
+    interrupts = (SimpleNamespace(value=pending),) if pending is not None else ()
+    return SimpleNamespace(tasks=(SimpleNamespace(interrupts=interrupts),))
+
+
+def _pending_payload(action_id: str = "action-001") -> dict[str, Any]:
+    return {
+        "kind": "offensive_tool_approval",
+        "action_id": action_id,
+        "agent": "mike",
+        "tool": "adversarial_evasion",
+        "arguments": {"target_endpoint": "https://models.example.com/predict"},
+        "target": "https://models.example.com/predict",
+        "warning": "Approve only if you are authorised to test it.",
+    }
+
+
 @pytest.fixture()
 def mock_graph() -> MagicMock:
-    """Create a mock compiled graph."""
+    """Create a mock compiled graph (not paused unless a test says so)."""
     graph = MagicMock()
     graph.ainvoke = AsyncMock(return_value=_mock_graph_state())
+    graph.aget_state = AsyncMock(return_value=_snapshot())
     graph.astream_events = MagicMock()
     return graph
 
@@ -509,6 +529,32 @@ async def test_delete_session_tenant_isolation(
     assert session_manager.get_session(foreign_id) is not None
 
 
+async def test_chat_starts_each_turn_with_a_fresh_escalation_budget_and_no_old_approvals(
+    client: httpx.AsyncClient, mock_graph: MagicMock
+) -> None:
+    resp = await client.post("/api/v1/chat", json={"message": "Hola"})
+    assert resp.status_code == 200
+
+    sent = mock_graph.ainvoke.call_args[0][0]
+    assert sent["turn_count"] == 0
+    assert sent["proposed_actions"] == []
+
+
+async def test_chat_returns_409_with_the_pending_action_when_the_session_is_paused(
+    client: httpx.AsyncClient, mock_graph: MagicMock, session_manager: SessionManager
+) -> None:
+    sid = session_manager.create_session(tenant_id="test-tenant", tier="pro")
+    mock_graph.aget_state = AsyncMock(return_value=_snapshot(_pending_payload()))
+
+    resp = await client.post("/api/v1/chat", json={"message": "Hola", "session_id": sid})
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "pending_action_required"
+    assert detail["pending_action"]["action_id"] == "action-001"
+    mock_graph.ainvoke.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # POST /confirm
 # ---------------------------------------------------------------------------
@@ -518,6 +564,7 @@ async def test_confirm_approved(
     client: httpx.AsyncClient, mock_graph: MagicMock, session_manager: SessionManager
 ) -> None:
     """Confirmation with approved=True resumes the graph."""
+    mock_graph.aget_state = AsyncMock(side_effect=[_snapshot(_pending_payload()), _snapshot()])
     sid = session_manager.create_session(tenant_id="test-tenant", tier="pro")
 
     mock_graph.ainvoke = AsyncMock(
@@ -548,13 +595,14 @@ async def test_confirm_approved(
     call_args = mock_graph.ainvoke.call_args
     command = call_args[0][0]
     assert hasattr(command, "resume")
-    assert command.resume == {"approved": True}
+    assert command.resume == {"action_id": "action-001", "approved": True}
 
 
 async def test_confirm_rejected(
     client: httpx.AsyncClient, mock_graph: MagicMock, session_manager: SessionManager
 ) -> None:
     """Confirmation with approved=False cancels the action."""
+    mock_graph.aget_state = AsyncMock(side_effect=[_snapshot(_pending_payload()), _snapshot()])
     sid = session_manager.create_session(tenant_id="test-tenant", tier="pro")
 
     mock_graph.ainvoke = AsyncMock(
@@ -582,13 +630,14 @@ async def test_confirm_rejected(
 
     call_args = mock_graph.ainvoke.call_args
     command = call_args[0][0]
-    assert command.resume == {"approved": False}
+    assert command.resume == {"action_id": "action-001", "approved": False}
 
 
 async def test_confirm_failure_returns_500(
     client: httpx.AsyncClient, mock_graph: MagicMock, session_manager: SessionManager
 ) -> None:
     """Confirmation resume failure returns 500."""
+    mock_graph.aget_state = AsyncMock(side_effect=[_snapshot(_pending_payload()), _snapshot()])
     sid = session_manager.create_session(tenant_id="test-tenant", tier="pro")
     mock_graph.ainvoke = AsyncMock(side_effect=RuntimeError("No pending interrupt"))
 

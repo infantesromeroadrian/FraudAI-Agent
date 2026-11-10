@@ -8,8 +8,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from fraudai.agents.graph import (
     build_fraud_ai_graph,
+    route_action_flow,
     route_after_agent,
-    route_after_confirmation,
     route_from_donna,
 )
 
@@ -60,9 +60,13 @@ def test_graph_has_expected_nodes():
         "jessica",
         "mike",
         "rachel",
-        "human_confirmation",
+        "approve_action",
+        "execute_action",
+        "finalize_actions",
+        "escalation_handoff",
         "responder",
     }
+    assert "human_confirmation" not in node_names  # the pre-planning gate is gone
     assert expected.issubset(node_names)
 
 
@@ -86,9 +90,10 @@ def test_route_from_donna_jessica():
     assert route_from_donna(state) == "jessica"
 
 
-def test_route_from_donna_mike_goes_to_confirmation():
+def test_route_from_donna_mike_plans_before_asking_approval():
+    # The approval comes per tool call after the model plans, not before routing.
     state = _base_state(current_agent="mike")
-    assert route_from_donna(state) == "mike_confirmation"
+    assert route_from_donna(state) == "mike"
 
 
 def test_route_from_donna_rachel():
@@ -112,32 +117,70 @@ def test_route_after_agent_respond():
 
 
 def test_route_after_agent_escalate():
-    state = _base_state(escalation_request={"target": "louis", "reason": "needs compliance"})
+    state = _base_state(
+        current_agent="harvey",
+        escalation_request={"target": "louis", "reason": "needs compliance"},
+    )
     assert route_after_agent(state) == "escalate"
 
 
 def test_route_after_agent_empty_dict_does_not_escalate():
     state = _base_state(escalation_request={})
-    # Empty dict is falsy-ish but dict is truthy in Python
-    # The routing checks truthiness of escalation_request
-    result = route_after_agent(state)
-    # Empty dict is truthy, so this escalates — that's the current behavior
-    assert result in ("respond", "escalate")
+    assert route_after_agent(state) == "respond"
+
+
+def test_route_after_agent_without_target_responds():
+    state = _base_state(
+        current_agent="harvey", escalation_request={"source": "harvey", "target": None}
+    )
+    assert route_after_agent(state) == "respond"
+
+
+def test_route_after_agent_unknown_or_self_target_responds():
+    for target in ("donna", "nobody", "harvey"):
+        state = _base_state(current_agent="harvey", escalation_request={"target": target})
+        assert route_after_agent(state) == "respond"
+
+
+def test_route_after_agent_stops_at_escalation_cap():
+    state = _base_state(
+        current_agent="harvey", escalation_request={"target": "louis"}, turn_count=3
+    )
+    assert route_after_agent(state) == "respond"
 
 
 # ---------------------------------------------------------------------------
-# route_after_confirmation
+# route_action_flow (approval-gated agent sub-flow)
 # ---------------------------------------------------------------------------
 
 
-def test_route_after_confirmation_approved():
-    state = _base_state(needs_human_confirmation=False)
-    assert route_after_confirmation(state) == "approved"
+def _proposal(status: str) -> dict:
+    return {"status": status}
 
 
-def test_route_after_confirmation_rejected():
-    state = _base_state(needs_human_confirmation=True)
-    assert route_after_confirmation(state) == "rejected"
+def test_route_action_flow_without_proposals_follows_agent_routing():
+    assert route_action_flow(_base_state(proposed_actions=[])) == "respond"
+    escalating = _base_state(
+        current_agent="mike", proposed_actions=[], escalation_request={"target": "harvey"}
+    )
+    assert route_action_flow(escalating) == "escalate"
+
+
+def test_route_action_flow_runs_allowed_calls_before_asking_about_the_next():
+    state = _base_state(proposed_actions=[_proposal("awaiting_approval"), _proposal("approved")])
+    assert route_action_flow(state) == "execute"
+
+
+def test_route_action_flow_asks_when_a_call_awaits_approval():
+    state = _base_state(proposed_actions=[_proposal("executed"), _proposal("awaiting_approval")])
+    assert route_action_flow(state) == "approve"
+
+
+def test_route_action_flow_finalizes_when_every_call_is_settled():
+    state = _base_state(
+        proposed_actions=[_proposal("executed"), _proposal("rejected"), _proposal("failed")]
+    )
+    assert route_action_flow(state) == "finalize"
 
 
 # ---------------------------------------------------------------------------
@@ -235,26 +278,32 @@ class TestSpecialistNodes:
 
         assert result["messages"][0].content == "Pipeline generated"
 
-    @patch("fraudai.agents.graph.invoke_claude_agent")
-    async def test_mike_agent_node(self, mock_invoke: AsyncMock) -> None:
+    async def test_mike_agent_node_answers_directly_when_no_tool_is_proposed(self) -> None:
+        from fraudai.agents import graph as graph_module
         from fraudai.agents.graph import mike_agent_node
 
-        mock_invoke.return_value = {
-            "message": AIMessage(content="Red team complete"),
-            "tool_results": [{"tool": "adversarial_evasion", "result": "bypassed"}],
-            "analysis_summary": "2 vulnerabilities found",
-            "escalation": None,
-        }
-
+        answer = AIMessage(content="Scope first: which endpoint do you own?")
+        invoker = MagicMock()
+        invoker.plan = AsyncMock(return_value=answer)
+        invoker.build_result = MagicMock(
+            return_value={
+                "message": answer,
+                "tool_results": [],
+                "analysis_summary": "scoping",
+                "escalation": None,
+            }
+        )
         state = _base_state(
             messages=[HumanMessage(content="Run red team")],
             current_agent="mike",
         )
 
-        result = await mike_agent_node(state)
+        with patch.object(graph_module, "_get_claude_invoker", AsyncMock(return_value=invoker)):
+            result = await mike_agent_node(state)
 
-        assert result["messages"][0].content == "Red team complete"
-        assert result["shared_context"]["last_analysis"] == "2 vulnerabilities found"
+        assert result["messages"] == [answer]
+        assert result["proposed_actions"] == []
+        assert result["shared_context"]["last_analysis"] == "scoping"
 
     @patch("fraudai.agents.graph.invoke_claude_agent")
     async def test_specialist_node_with_escalation(self, mock_invoke: AsyncMock) -> None:
@@ -304,84 +353,6 @@ class TestSpecialistNodes:
 
 
 # ---------------------------------------------------------------------------
-# human_confirmation_node
-# ---------------------------------------------------------------------------
-
-
-class TestHumanConfirmationNode:
-    """Tests for the human_confirmation_node."""
-
-    @patch("fraudai.agents.graph.interrupt")
-    async def test_approved_sets_confirmation_false(self, mock_interrupt: MagicMock) -> None:
-        from fraudai.agents.graph import human_confirmation_node
-
-        mock_interrupt.return_value = {"approved": True}
-
-        state = _base_state(
-            messages=[HumanMessage(content="Run red team test")],
-            current_agent="mike",
-        )
-
-        result = await human_confirmation_node(state)
-
-        assert result["needs_human_confirmation"] is False
-
-    @patch("fraudai.agents.graph.interrupt")
-    async def test_rejected_sets_confirmation_true(self, mock_interrupt: MagicMock) -> None:
-        from fraudai.agents.graph import human_confirmation_node
-
-        mock_interrupt.return_value = {"approved": False}
-
-        state = _base_state(
-            messages=[HumanMessage(content="Run red team test")],
-            current_agent="mike",
-        )
-
-        result = await human_confirmation_node(state)
-
-        assert result["needs_human_confirmation"] is True
-
-    @patch("fraudai.agents.graph.interrupt")
-    async def test_non_dict_response_treated_as_rejected(
-        self,
-        mock_interrupt: MagicMock,
-    ) -> None:
-        from fraudai.agents.graph import human_confirmation_node
-
-        mock_interrupt.return_value = "invalid"
-
-        state = _base_state(
-            messages=[HumanMessage(content="Run red team test")],
-            current_agent="mike",
-        )
-
-        result = await human_confirmation_node(state)
-
-        assert result["needs_human_confirmation"] is True
-
-    @patch("fraudai.agents.graph.interrupt")
-    async def test_interrupt_called_with_correct_payload(
-        self,
-        mock_interrupt: MagicMock,
-    ) -> None:
-        from fraudai.agents.graph import human_confirmation_node
-
-        mock_interrupt.return_value = {"approved": True}
-
-        state = _base_state(
-            messages=[HumanMessage(content="Test prompt injection")],
-            current_agent="mike",
-        )
-
-        await human_confirmation_node(state)
-
-        call_args = mock_interrupt.call_args[0][0]
-        assert call_args["action"] == "confirm_red_teaming"
-        assert "Test prompt injection" in call_args["description"]
-        assert "offensive security tools" in call_args["warning"]
-
-
-# ---------------------------------------------------------------------------
 # responder_node
 # ---------------------------------------------------------------------------
 
@@ -401,38 +372,6 @@ class TestResponderNode:
         result = await responder_node(state)
 
         # Pass-through returns empty dict
-        assert result == {}
-
-    async def test_cancellation_for_rejected_mike(self) -> None:
-        from fraudai.agents.graph import responder_node
-
-        state = _base_state(
-            messages=[HumanMessage(content="run red team")],
-            current_agent="mike",
-            needs_human_confirmation=True,
-        )
-
-        result = await responder_node(state)
-
-        assert len(result["messages"]) == 1
-        assert "cancelled by user" in result["messages"][0].content
-        assert result["needs_human_confirmation"] is False
-
-    async def test_no_cancellation_for_other_agents_with_confirmation_flag(self) -> None:
-        from fraudai.agents.graph import responder_node
-
-        state = _base_state(
-            messages=[HumanMessage(content="query")],
-            current_agent="harvey",
-            needs_human_confirmation=True,
-        )
-
-        # Harvey with needs_human_confirmation=True — both conditions must be true
-        # for cancellation, and current_agent must be "mike"
-        result = await responder_node(state)
-
-        # The condition is: needs_human_confirmation AND current_agent == "mike"
-        # Since current_agent is "harvey", this should be pass-through
         assert result == {}
 
 

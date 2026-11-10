@@ -11,6 +11,7 @@ Reference architecture:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -18,6 +19,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from weakref import WeakValueDictionary
 
 import httpx as httpx_client
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
@@ -27,6 +29,7 @@ from langgraph.types import Command
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
+from fraudai.agents.hitl import APPROVAL_KIND
 from fraudai.api.auth import User, create_token, get_admin_user, get_current_user
 from fraudai.api.schemas import (
     ChatRequest,
@@ -36,6 +39,7 @@ from fraudai.api.schemas import (
     FeedbackRequest,
     FileUploadResponse,
     HealthResponse,
+    PendingAction,
     ResponseMetadata,
     SessionInfo,
     TokenResponse,
@@ -219,6 +223,84 @@ def _build_metadata(state: dict[str, Any], latency_ms: int) -> ResponseMetadata:
 
 
 # ---------------------------------------------------------------------------
+# Human approval (R2): pending actions and per-session serialisation
+# ---------------------------------------------------------------------------
+
+_SPECIALIST_NODES = frozenset({"harvey", "louis", "jessica", "mike", "rachel"})
+
+PENDING_ACTION_MESSAGE = (
+    "Approval required before an offensive tool runs. "
+    "Review the pending action and confirm or reject it."
+)
+
+# One lock per session serialises chat/stream/confirm so two requests cannot
+# resume or start the same paused thread at once.  Scope: this process only
+# (the checkpointer is in-memory too); several workers would need a shared lock
+# and a shared checkpointer.  Weak values: a lock disappears once unused.
+_session_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def _session_lock(session_id: str) -> asyncio.Lock:
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[session_id] = lock
+    return lock
+
+
+async def _pending_action(
+    graph: CompiledStateGraph,  # type: ignore[type-arg]
+    config: RunnableConfig,
+) -> PendingAction | None:
+    """The approval the session's thread is paused on, read from its checkpoint."""
+    snapshot = await graph.aget_state(config)
+    for task in snapshot.tasks:
+        for pending in task.interrupts:
+            value = pending.value
+            if isinstance(value, dict) and value.get("kind") == APPROVAL_KIND:
+                return PendingAction.model_validate(value)
+    return None
+
+
+def _approval_conflict(code: str, message: str, pending: PendingAction | None) -> HTTPException:
+    """409 whose body re-presents the pending action, so a client that lost it can recover."""
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": code,
+            "message": message,
+            "pending_action": pending.model_dump() if pending is not None else None,
+        },
+    )
+
+
+def _chat_response(
+    session_id: str,
+    final_state: dict[str, Any],
+    pending: PendingAction | None,
+    latency_ms: int,
+    default_agent: str,
+) -> ChatResponse:
+    """Build the response for a finished or paused turn."""
+    if pending is not None:
+        return ChatResponse(
+            session_id=session_id,
+            agent=pending.agent,
+            message=PENDING_ACTION_MESSAGE,
+            metadata=_build_metadata(final_state, latency_ms),
+            pending_action=pending,
+        )
+    return ChatResponse(
+        session_id=session_id,
+        agent=final_state.get("current_agent") or default_agent,
+        message=_extract_response_text(final_state),
+        citations=_extract_citations(final_state),
+        tool_results=_extract_tool_results(final_state),
+        metadata=_build_metadata(final_state, latency_ms),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Auth (SR-010 — OAuth2/JWT)
 # ---------------------------------------------------------------------------
 
@@ -306,6 +388,8 @@ async def chat(
         "current_agent": None,  # Force Donna to re-classify on every message
         "previous_agent": previous_agent,  # For conversational continuity
         "escalation_request": None,  # Clear any previous escalation
+        "turn_count": 0,  # Escalation cap is per turn, not per session
+        "proposed_actions": [],  # A new turn never inherits an earlier approval
     }
 
     # Agent override: bypass Donna routing
@@ -314,36 +398,34 @@ async def chat(
 
     config = cast("RunnableConfig", {"configurable": {"thread_id": session_id}})
 
-    try:
-        with bind_session(session_id):
-            final_state = await graph.ainvoke(input_state, config=config)
-    except Exception as exc:
-        logger.exception("Graph invocation failed for session %s", session_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Agent processing failed. Please try again.",
-        ) from exc
+    async with _session_lock(session_id):
+        # A paused session must be resolved first: a new message would start
+        # a new run over the same thread and could skip or replace the approval.
+        waiting = await _pending_action(graph, config)
+        if waiting is not None:
+            raise _approval_conflict(
+                "pending_action_required",
+                "Resolve the pending action with /confirm before sending a new message.",
+                waiting,
+            )
+        try:
+            with bind_session(session_id):
+                final_state = await graph.ainvoke(input_state, config=config)
+        except Exception as exc:
+            logger.exception("Graph invocation failed for session %s", session_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Agent processing failed. Please try again.",
+            ) from exc
+        pending = await _pending_action(graph, config)
 
     latency_ms = int((time.monotonic() - start_time) * 1000)
-
-    # Extract results from final state
-    agent = final_state.get("current_agent") or "donna"
-    response_text = _extract_response_text(final_state)
-    citations = _extract_citations(final_state)
-    tool_results = _extract_tool_results(final_state)
-    metadata = _build_metadata(final_state, latency_ms)
+    response = _chat_response(session_id, final_state, pending, latency_ms, "donna")
 
     # Record turn in session
-    session_mgr.record_turn(session_id, agent)
+    session_mgr.record_turn(session_id, response.agent)
 
-    return ChatResponse(
-        session_id=session_id,
-        agent=agent,
-        message=response_text,
-        citations=citations,
-        tool_results=tool_results,
-        metadata=metadata,
-    )
+    return response
 
 
 @router.post("/chat/stream")
@@ -363,7 +445,11 @@ async def chat_stream(
     - ``citation``: A normative citation from the RAG corpus.
     - ``tool_start``: A tool execution has begun.
     - ``tool_end``: A tool execution completed (includes ToolResult).
-    - ``done``: Stream complete; includes full ResponseMetadata.
+    - ``pending_action``: The turn paused for approval; carries the
+      ``PendingAction`` (tool, arguments, target, ``action_id``). Nothing
+      offensive has run. Resolve it with ``POST /confirm``.
+    - ``done``: Stream complete; includes full ResponseMetadata (and
+      ``pending_action`` when paused).
     - ``error``: An error occurred during processing.
     """
     graph = _get_graph(request)
@@ -380,12 +466,24 @@ async def chat_stream(
         "language": request_body.language,
         "current_agent": None,
         "escalation_request": None,
+        "turn_count": 0,
+        "proposed_actions": [],
     }
 
     if request_body.agent_override is not None:
         input_state["current_agent"] = request_body.agent_override
 
     config = cast("RunnableConfig", {"configurable": {"thread_id": session_id}})
+
+    # Refuse before the stream opens when the session is paused on an approval.
+    async with _session_lock(session_id):
+        waiting = await _pending_action(graph, config)
+    if waiting is not None:
+        raise _approval_conflict(
+            "pending_action_required",
+            "Resolve the pending action with /confirm before sending a new message.",
+            waiting,
+        )
 
     async def stream_events() -> AsyncGenerator[str, None]:
         accumulated_content = ""
@@ -394,6 +492,17 @@ async def chat_stream(
         start_time = time.monotonic()
 
         try:
+            # Re-check under the lock: another request may have paused the
+            # session between the pre-check and this generator starting.
+            if await _pending_action(graph, config) is not None:
+                busy = {
+                    "type": "error",
+                    "code": "pending_action_required",
+                    "message": "Resolve the pending action with /confirm first.",
+                }
+                yield f"data: {json.dumps(busy)}\n\n"
+                return
+
             async for event in graph.astream_events(input_state, config=config, version="v2"):
                 event_type = event.get("event", "")
 
@@ -408,11 +517,9 @@ async def chat_stream(
                     # Detect which agent's model is running
                     meta = event.get("metadata", {})
                     langgraph_node = meta.get("langgraph_node", "")
-                    if langgraph_node and langgraph_node not in (
-                        "donna",
-                        "responder",
-                        "human_confirmation",
-                    ):
+                    # Only specialist nodes are agents: helper nodes such as
+                    # ``finalize_actions`` also call the model but are not identities.
+                    if langgraph_node in _SPECIALIST_NODES:
                         agent_name = langgraph_node
 
                 elif event_type == "on_chain_end":
@@ -451,6 +558,13 @@ async def chat_stream(
                     payload = {"type": "tool_result", "tool_result": tool_result}
                     yield f"data: {json.dumps(payload)}\n\n"
 
+            pending = await _pending_action(graph, config)
+            if pending is not None:
+                agent_name = pending.agent
+                accumulated_content = PENDING_ACTION_MESSAGE
+                pending_payload = {"type": "pending_action", "pending_action": pending.model_dump()}
+                yield f"data: {json.dumps(pending_payload)}\n\n"
+
             # Record turn in session before completing
             session_mgr.record_turn(session_id, agent_name)
 
@@ -462,6 +576,7 @@ async def chat_stream(
                 "message": accumulated_content or "No response generated.",
                 "citations": [],
                 "tool_results": tool_results_acc,
+                "pending_action": pending.model_dump() if pending is not None else None,
                 "metadata": {
                     "routing_agent": agent_name,
                     "routing_confidence": 0.0,
@@ -481,9 +596,10 @@ async def chat_stream(
     async def event_generator() -> AsyncGenerator[str, None]:
         # The generator runs after this handler returned, so the session must
         # be bound here, inside the task that actually drives the graph.
-        with bind_session(session_id):
-            async for chunk in stream_events():
-                yield chunk
+        async with _session_lock(session_id):
+            with bind_session(session_id):
+                async for chunk in stream_events():
+                    yield chunk
 
     return StreamingResponse(
         event_generator(),
@@ -811,14 +927,18 @@ async def confirm_action(
     request: Request,
     user: User = Depends(get_current_user),
 ) -> ChatResponse:
-    """Approve or reject a pending red teaming action (Mike Ross HITL).
+    """Approve or reject ONE pending offensive tool call (Mike Ross HITL).
 
-    When Mike Ross proposes an offensive action (adversarial evasion,
-    prompt injection test, model extraction), the graph pauses via
-    ``interrupt()`` (ADR-003) and waits for user confirmation.
+    The graph pauses via ``interrupt()`` (ADR-003) on each proposed call and
+    ``pending_action`` tells the client exactly what is awaiting a decision.
+    ``action_id`` must match that action.
 
-    - ``approved=True``: Resumes the graph and executes the action.
-    - ``approved=False``: Cancels the action and returns a summary.
+    - ``approved=true``: runs that single call, once.
+    - ``approved=false``: cancels it; it never runs.
+
+    A turn may hold several calls: the response then carries the next
+    ``pending_action``. 404: session not yours. 409: no pending action, or
+    ``action_id`` is stale/unknown (the pending one, if any, is in the body).
 
     SEC-006: No offensive tool executes without explicit user approval.
     """
@@ -827,41 +947,44 @@ async def confirm_action(
     start_time = time.monotonic()
 
     # Ownership first: resuming a foreign thread would execute its pending action.
-    # Binding ``action_id`` to the pending interrupt is F4.
     session_id = _owned_session(session_mgr, request_body.session_id, user).session_id
     config = cast("RunnableConfig", {"configurable": {"thread_id": session_id}})
 
-    try:
-        with bind_session(session_id):
-            final_state = await graph.ainvoke(
-                Command(resume={"approved": request_body.approved}),
-                config=config,
+    async with _session_lock(session_id):
+        # Validate against the checkpoint before resuming: a wrong id must not
+        # reach the graph, and a repeated or concurrent confirm finds nothing pending.
+        waiting = await _pending_action(graph, config)
+        if waiting is None:
+            raise _approval_conflict("no_pending_action", "No action is awaiting approval.", None)
+        if waiting.action_id != request_body.action_id:
+            raise _approval_conflict(
+                "action_id_mismatch",
+                "action_id does not match the pending action.",
+                waiting,
             )
-    except Exception as exc:
-        logger.exception("Confirmation resume failed for session %s", session_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process confirmation. The session may not have a pending action.",
-        ) from exc
+
+        try:
+            with bind_session(session_id):
+                final_state = await graph.ainvoke(
+                    Command(
+                        resume={"action_id": waiting.action_id, "approved": request_body.approved}
+                    ),
+                    config=config,
+                )
+        except Exception as exc:
+            logger.exception("Confirmation resume failed for session %s", session_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to process confirmation. The session may not have a pending action.",
+            ) from exc
+        pending = await _pending_action(graph, config)
 
     latency_ms = int((time.monotonic() - start_time) * 1000)
+    response = _chat_response(session_id, final_state, pending, latency_ms, "mike")
 
-    agent = final_state.get("current_agent") or "mike"
-    response_text = _extract_response_text(final_state)
-    citations = _extract_citations(final_state)
-    tool_results = _extract_tool_results(final_state)
-    metadata = _build_metadata(final_state, latency_ms)
+    session_mgr.record_turn(session_id, response.agent)
 
-    session_mgr.record_turn(session_id, agent)
-
-    return ChatResponse(
-        session_id=session_id,
-        agent=agent,
-        message=response_text,
-        citations=citations,
-        tool_results=tool_results,
-        metadata=metadata,
-    )
+    return response
 
 
 # ---------------------------------------------------------------------------
