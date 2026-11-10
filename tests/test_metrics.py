@@ -276,19 +276,11 @@ class TestAdminMetricsEndpoint:
         """The endpoint should return Prometheus text exposition format."""
         from starlette.testclient import TestClient
 
-        from fraudai.api.auth import User, get_admin_user
-
-        admin_user = User(
-            user_id="admin-1",
-            tenant_id="tenant-1",
-            email="admin@test.com",
-            tier="enterprise",
-            is_admin=True,
-        )
+        from fraudai.api.auth import require_metrics_access
 
         app = _create_test_app()
         # Use FastAPI dependency_overrides to bypass auth
-        app.dependency_overrides[get_admin_user] = lambda: admin_user
+        app.dependency_overrides[require_metrics_access] = lambda: None
 
         with TestClient(app) as client:
             response = client.get("/api/v1/admin/metrics")

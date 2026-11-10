@@ -25,10 +25,15 @@ if TYPE_CHECKING:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from fraudai.api.auth import configure_login_throttle, credentials_from_settings, load_scrape_token
+from fraudai.api.health import HealthMonitor, build_checks, served_build_sha
+from fraudai.api.limits import TenantRateLimiter
+from fraudai.api.logging_config import configure_logging
 from fraudai.api.middleware import MetricsMiddleware
 from fraudai.api.routes import router as api_router
 from fraudai.api.session_manager import SessionManager
 from fraudai.core.config import settings
+from fraudai.core.database import Database, DatabaseUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +113,58 @@ async def init_sandbox_tools(
     )
 
 
+async def init_database(cfg: Settings) -> Database | None:
+    """Open the configured SQLite database; staging and production never run without it.
+
+    A database that cannot be created or written stops startup outside development, so a
+    deployment can never silently lose sessions and feedback to a memory-only fallback.
+    Development degrades, loudly, to in-memory state.
+    """
+    db = Database(cfg.database_path)
+    try:
+        await db.initialize()
+    except DatabaseUnavailableError:
+        if cfg.environment != "development":
+            logger.exception("Database unavailable; refusing to start in %s", cfg.environment)
+            raise
+        logger.exception(
+            "Database unavailable -- development continues with in-memory sessions "
+            "and feedback only (nothing will survive a restart)"
+        )
+        return None
+    logger.info("SQLite database ready for session/feedback persistence")
+    return db
+
+
+def publish_system_info(cfg: Settings) -> None:
+    """Expose version, environment and build SHA (``unknown`` if the image has none)."""
+    from fraudai.core.metrics import SYSTEM_INFO
+
+    SYSTEM_INFO.info(
+        {
+            "version": "0.1.0",
+            "environment": cfg.environment,
+            "build_sha": served_build_sha(cfg) or "unknown",
+        }
+    )
+
+
+def _warn_about_missing_operator_config(cfg: Settings) -> None:
+    """Outside development a missing login or scrape credential is operator-visible."""
+    if cfg.environment == "development":
+        return
+    if credentials_from_settings(cfg) is None:
+        logger.warning(
+            "Login is not configured (AUTH_USERNAME / AUTH_PASSWORD_HASH): "
+            "POST /auth/token answers 503 until it is"
+        )
+    if load_scrape_token(cfg) is None:
+        logger.warning(
+            "No metrics scrape credential (METRICS_SCRAPE_TOKEN_FILE or METRICS_SCRAPE_TOKEN): "
+            "only an admin JWT can read /admin/metrics"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Application lifespan: startup and shutdown hooks.
@@ -178,20 +235,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     graph = build_fraud_ai_graph()
     logger.info("LangGraph orchestration graph compiled")
 
-    # Database (SQLite persistence -- graceful degradation to in-memory if unavailable)
-    from fraudai.core.database import Database
-
-    db: Database | None = None
-    try:
-        db = Database()
-        await db.initialize()
-        logger.info("SQLite database initialized for session/feedback persistence")
-    except Exception:
-        logger.exception("Database initialization failed -- falling back to in-memory only")
-        db = None
+    # Database (SQLite): a hard requirement outside development (see init_database).
+    db = await init_database(settings)
 
     # Session manager (in-memory cache + optional DB persistence)
-    session_manager = SessionManager(db=db)
+    session_manager = SessionManager(
+        db=db, max_sessions_per_tenant=settings.max_sessions_per_tenant
+    )
     if db is not None:
         await session_manager.load_from_db()
 
@@ -200,15 +250,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     feedback_store: deque[dict[str, Any]] = deque(maxlen=10_000)
 
-    # Publish system info to Prometheus
-    from fraudai.core.metrics import SYSTEM_INFO
+    publish_system_info(settings)
+    configure_login_throttle(settings)
+    _warn_about_missing_operator_config(settings)
 
-    SYSTEM_INFO.info(
-        {
-            "version": "0.1.0",
-            "environment": settings.environment,
-        }
+    # Cached dependency health: the monitor checks in the background, probes read it.
+    checks, required = build_checks(store=store, db=db, cfg=settings)
+    health_monitor = HealthMonitor(
+        checks,
+        required,
+        settings.readiness_interval_seconds,
+        corpus_version_probe=store.get_corpus_version,
     )
+    health_monitor.start()
 
     # Attach to app.state for route access
     app.state.graph = graph
@@ -219,10 +273,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.retriever = retriever
     app.state.embedder = embedder
     app.state.db = db
+    app.state.health_monitor = health_monitor
+    app.state.rate_limiter = TenantRateLimiter(settings.rate_limit_requests_per_minute)
 
     yield
 
-    # --- Shutdown ---
+    # --- Shutdown: stop the producers first, then drain writes, then close the database ---
+    await health_monitor.stop()
+    await session_manager.aclose()
     if db is not None:
         await db.close()
     logger.info("Shutting down FraudAI Agent API")
@@ -245,11 +303,8 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
-    # --- Structured logging with correlation IDs ---
-    # Disabled during uvicorn dev: correlation_id format conflicts with
-    # uvicorn's root logger handlers. Tracing works in production via
-    # the MetricsMiddleware which sets correlation IDs independently.
-    # setup_tracing()
+    # --- Structured logging: JSON lines carrying the request correlation id ---
+    configure_logging(level=settings.log_level, fmt=settings.log_format)
 
     # --- CORS ---
     # Permissive in development; lock down in production via env config.
