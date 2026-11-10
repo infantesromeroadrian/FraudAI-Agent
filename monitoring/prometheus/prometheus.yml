@@ -31,10 +31,11 @@ scrape_configs:
       - targets: ["fraudai:8000"]
         labels:
           environment: local
-    # The dedicated metrics-only credential (F5c), mounted as a compose secret file.
+    # The dedicated metrics-only credential (F5c), written at start by entrypoint.sh into a
+    # private tmpfs from the METRICS_SCRAPE_TOKEN variable.
     authorization:
       type: Bearer
-      credentials_file: /run/secrets/fraudai_metrics_token
+      credentials_file: /run/prometheus-credentials/metrics-token
 
   # --- Qdrant Vector Database ---
   - job_name: qdrant

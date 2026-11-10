@@ -13,11 +13,11 @@ docker run --rm --entrypoint promtool \
 echo "== promtool check config (rules + scrape config, with a throw-away credential file)"
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
-printf 'placeholder-not-a-credential' > "${scratch}/fraudai_metrics_token"
+printf 'placeholder-not-a-credential' > "${scratch}/metrics-token"
 docker run --rm --entrypoint promtool \
     -v "${PROJECT_DIR}/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
     -v "${PROJECT_DIR}/monitoring/alerts:/etc/prometheus/rules:ro" \
-    -v "${scratch}/fraudai_metrics_token:/run/secrets/fraudai_metrics_token:ro" \
+    -v "${scratch}/metrics-token:/run/prometheus-credentials/metrics-token:ro" \
     "$PROM_IMAGE" check config /etc/prometheus/prometheus.yml
 
 echo "== every metric used by rules and dashboards is exposed"
