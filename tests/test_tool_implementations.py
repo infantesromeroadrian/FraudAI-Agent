@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -970,23 +970,18 @@ class TestSandboxFailureHandling:
 
 
 class TestConstructor:
-    def test_creates_networked_sandbox_if_not_provided(
+    def test_networked_engine_defaults_to_the_same_engine(
         self,
         mock_sandbox: MagicMock,
     ) -> None:
-        """Constructor should create a networked sandbox from the default one's client."""
-        with patch("fraudai.tools.implementations.SandboxEngine") as mock_engine:
-            mock_engine.return_value = MagicMock()
-            ToolImplementations(sandbox=mock_sandbox)
+        """No second engine: the engine grants network only for a validated EgressTarget."""
+        impls = ToolImplementations(sandbox=mock_sandbox)
 
-            mock_engine.assert_called_once_with(
-                docker_client=mock_sandbox._client,
-                image=mock_sandbox._image,
-                timeout=mock_sandbox._timeout,
-                mem_limit=mock_sandbox._mem_limit,
-                cpu_count=mock_sandbox._cpu_count,
-                network_disabled=False,
-            )
+        assert impls._sandbox_networked is mock_sandbox
+
+    def test_sandbox_is_required_unless_explicitly_disabled(self) -> None:
+        with pytest.raises(ValueError, match="explicitly disabled"):
+            ToolImplementations(sandbox=None)
 
     def test_uses_provided_networked_sandbox(
         self,

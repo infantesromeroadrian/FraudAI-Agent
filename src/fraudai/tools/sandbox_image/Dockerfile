@@ -10,6 +10,11 @@ RUN pip install --no-cache-dir --require-hashes --no-deps -r /tmp/requirements.l
     && pip uninstall -y setuptools wheel \
     && rm -rf /root/.cache /tmp/requirements.lock
 
+# Headless plotting and no bytecode writes: the engine runs this image with a
+# read-only root filesystem, so nothing but /tmp and /workspace/output is writable.
+ENV MPLBACKEND=Agg \
+    PYTHONDONTWRITEBYTECODE=1
+
 # Security: non-root user with minimal shell
 RUN useradd -m -s /bin/bash sandbox
 USER sandbox

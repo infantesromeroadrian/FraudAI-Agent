@@ -8,52 +8,102 @@ Tools that produce text (Louis, Rachel.generate_pipeline) return structured
 dicts directly without sandbox execution.
 
 Architecture note:
-    Mike's red-teaming tools require ``network_disabled=False`` because
-    they attack external endpoints.  A dedicated ``SandboxEngine`` instance
-    with networking enabled is created for these tools.
+    Mike's red-teaming tools attack external endpoints. They validate the
+    target with an ``EgressPolicy`` (one DNS resolution, address pinned) and pass
+    the resulting ``EgressTarget`` to the sandbox, which then reaches that single
+    address through a forwarding container and nothing else (ADR-007). Every
+    other tool runs with no network at all.
 """
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
+import functools
 import json
 import logging
-import socket
 import textwrap
-from typing import Any
-from urllib.parse import urlsplit
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec
 
 from fraudai.core.session_context import active_session_id, upload_dir
-from fraudai.tools.sandbox import SandboxEngine, SandboxResult
+from fraudai.tools.egress import EgressPolicy, EgressTarget, system_resolver
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+
+    from fraudai.tools.sandbox import SandboxEngine, SandboxResult
 
 logger = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxDisabled:
+    """Why sandbox-backed tools cannot run in this deployment.
+
+    ``code`` is stable and machine-readable: ``sandbox_disabled`` (turned off by
+    configuration, e.g. Compose without a Docker socket) or ``sandbox_unavailable``
+    (enabled but Docker or the image is missing).
+    """
+
+    code: str
+    reason: str
+
+
+def _needs_sandbox(
+    method: Callable[Concatenate[ToolImplementations, _P], Coroutine[Any, Any, dict[str, Any]]],
+) -> Callable[Concatenate[ToolImplementations, _P], Coroutine[Any, Any, dict[str, Any]]]:
+    """Return an explicit error, never stub data, when the sandbox is off."""
+
+    @functools.wraps(method)
+    async def wrapper(
+        self: ToolImplementations, /, *args: _P.args, **kwargs: _P.kwargs
+    ) -> dict[str, Any]:
+        if self._disabled is not None:
+            logger.warning("%s refused: %s", method.__name__, self._disabled.code)
+            return {
+                "status": "disabled",
+                "error_code": self._disabled.code,
+                "error": self._disabled.reason,
+                "tool": method.__name__,
+            }
+        return await method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class ToolImplementations:
     """Real implementations of agent tools backed by SandboxEngine.
 
     Args:
-        sandbox: Default sandbox engine (network disabled) for safe
-            data-analysis tools (Harvey, Jessica, Rachel).
-        sandbox_networked: Optional sandbox engine with network enabled
-            for Mike's red-teaming tools.  If not provided, a networked
-            sandbox is created from the default one's Docker client.
+        sandbox: Sandbox engine. ``None`` only together with ``disabled``.
+        sandbox_networked: Optional separate engine for Mike's red-teaming
+            tools; defaults to ``sandbox`` (the engine itself grants network
+            only when it is handed a validated ``EgressTarget``).
+        egress_policy: Target validation policy. The default resolves through
+            ``_resolve_host`` and accepts only globally routable addresses;
+            tests may inject a policy for a synthetic target without relaxing
+            the default.
+        disabled: When set, every sandbox-backed tool returns an explicit
+            ``status="disabled"`` error instead of running.
     """
 
     def __init__(
         self,
-        sandbox: SandboxEngine,
+        sandbox: SandboxEngine | None,
         sandbox_networked: SandboxEngine | None = None,
+        egress_policy: EgressPolicy | None = None,
+        disabled: SandboxDisabled | None = None,
     ) -> None:
-        self._sandbox = sandbox
-        self._sandbox_networked = sandbox_networked or SandboxEngine(
-            docker_client=sandbox._client,
-            image=sandbox._image,
-            timeout=sandbox._timeout,
-            mem_limit=sandbox._mem_limit,
-            cpu_count=sandbox._cpu_count,
-            network_disabled=False,
+        if sandbox is None and disabled is None:
+            msg = "A sandbox engine is required unless the tools are explicitly disabled"
+            raise ValueError(msg)
+        self._sandbox: Any = sandbox
+        self._sandbox_networked: Any = sandbox_networked or sandbox
+        self._disabled = disabled
+        self._egress_policy = egress_policy or EgressPolicy(
+            resolver=lambda hostname: self._resolve_host(hostname)
         )
 
     # ===================================================================
@@ -162,6 +212,7 @@ class ToolImplementations:
     # Harvey Specter -- Transaction Fraud Detection
     # ===================================================================
 
+    @_needs_sandbox
     async def analyze_transactions(
         self,
         data_path: str,
@@ -237,6 +288,7 @@ class ToolImplementations:
                 json.dump(result, f, default=str)
         """)
 
+    @_needs_sandbox
     async def detect_patterns(
         self,
         data_path: str,
@@ -343,6 +395,7 @@ class ToolImplementations:
                 json.dump(result, f, default=str)
         """)
 
+    @_needs_sandbox
     async def risk_scoring(self, data_path: str) -> dict[str, Any]:
         """Calculate composite risk scores (0-100) per transaction and account."""
         logger.info("risk_scoring: data_path=%s", data_path)
@@ -781,6 +834,7 @@ class ToolImplementations:
     # Jessica Pearson -- Fraud Intelligence
     # ===================================================================
 
+    @_needs_sandbox
     async def graph_analysis(self, data_path: str) -> dict[str, Any]:
         """Build and analyse a transaction graph using NetworkX."""
         logger.info("graph_analysis: data_path=%s", data_path)
@@ -946,48 +1000,22 @@ class ToolImplementations:
     @staticmethod
     def _resolve_host(hostname: str) -> list[str]:
         """Resolve a hostname to every IP address it maps to."""
-        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-        return sorted({str(info[4][0]) for info in infos})
+        return system_resolver(hostname)
 
-    def _validate_target_endpoint(self, target_endpoint: str) -> None:
-        """Allow only http(s) URLs whose host resolves to public addresses.
+    def _validate_target_endpoint(self, target_endpoint: str) -> EgressTarget:
+        """Validate a red-teaming target and pin the address it may reach.
 
-        SSRF prevention for the networked sandbox. The previous substring
-        deny-list missed decimal or IPv6-mapped IPs, CGNAT and private IPv6
-        ranges, and hostnames that resolve to private addresses.
-
-        Residual risk: the sandbox resolves the name again when it connects,
-        so DNS rebinding can still reach an internal address. Closing that
-        needs an egress policy on the sandbox network, not application code.
+        The host is resolved exactly once; the sandbox is only ever connected to
+        the pinned address (through the egress forwarder), so re-resolution by
+        the generated client, DNS rebinding and redirects to other addresses
+        cannot change where traffic goes.
 
         Raises:
             PermissionError: The endpoint is not an allowed external target.
         """
-        parts = urlsplit(target_endpoint.strip())
-        if parts.scheme not in ("http", "https") or not parts.hostname:
-            msg = f"Target endpoint blocked: only http(s) URLs are allowed: {target_endpoint}"
-            raise PermissionError(msg)
-        if parts.username or parts.password:
-            msg = f"Target endpoint blocked: credentials in URL: {target_endpoint}"
-            raise PermissionError(msg)
+        return self._egress_policy.validate(target_endpoint)
 
-        try:
-            addresses = self._resolve_host(parts.hostname)
-        except (OSError, UnicodeError) as exc:
-            msg = f"Target endpoint blocked: cannot resolve host: {target_endpoint}"
-            raise PermissionError(msg) from exc
-        if not addresses:
-            msg = f"Target endpoint blocked: host has no addresses: {target_endpoint}"
-            raise PermissionError(msg)
-
-        for address in addresses:
-            ip = ipaddress.ip_address(address.split("%", 1)[0])
-            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-                ip = ip.ipv4_mapped
-            if not ip.is_global:
-                msg = f"Target endpoint blocked (SSRF prevention): {target_endpoint}"
-                raise PermissionError(msg)
-
+    @_needs_sandbox
     async def adversarial_evasion(
         self,
         target_endpoint: str,
@@ -1005,7 +1033,7 @@ class ToolImplementations:
         if attack_type not in self.PERTURBATIONS:
             msg = f"Unknown perturbation {attack_type!r}; expected one of {self.PERTURBATIONS}"
             raise ValueError(msg)
-        await asyncio.to_thread(self._validate_target_endpoint, target_endpoint)
+        egress = await asyncio.to_thread(self._validate_target_endpoint, target_endpoint)
         logger.info(
             "adversarial_evasion: target=%s, attack_type=%s",
             target_endpoint,
@@ -1016,6 +1044,7 @@ class ToolImplementations:
         result = await self._sandbox_networked.execute_python(
             code=code,
             timeout=300,
+            egress=egress,
         )
         return self._parse_sandbox_result(result)
 
@@ -1045,6 +1074,17 @@ class ToolImplementations:
                 "target_endpoint": TARGET_ENDPOINT,
             }}
 
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                \"\"\"A 3xx answer is an error, never a hop to another address.\"\"\"
+
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            # No environment proxies and no redirects: the only reachable peer is
+            # the validated target behind the sandbox's egress forwarder.
+            _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({{}}), _NoRedirect)
+            MAX_BODY_BYTES = 1048576
+
             def query_endpoint(features):
                 \"\"\"Send a prediction request to the target endpoint.\"\"\"
                 payload = json.dumps({{"features": features.tolist()}}).encode("utf-8")
@@ -1055,8 +1095,8 @@ class ToolImplementations:
                     method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        return json.loads(resp.read().decode())
+                    with _OPENER.open(req, timeout=10) as resp:
+                        return json.loads(resp.read(MAX_BODY_BYTES).decode())
                 except (urllib.error.URLError, urllib.error.HTTPError, Exception) as e:
                     return {{"error": str(e)}}
 
@@ -1142,6 +1182,7 @@ class ToolImplementations:
                 json.dump(result, f, default=str)
         """)
 
+    @_needs_sandbox
     async def prompt_injection_suite(
         self,
         target_endpoint: str,
@@ -1152,7 +1193,7 @@ class ToolImplementations:
         Uses the networked sandbox since it needs to reach external endpoints.
         Target must be an external endpoint — internal networks are blocked.
         """
-        await asyncio.to_thread(self._validate_target_endpoint, target_endpoint)
+        egress = await asyncio.to_thread(self._validate_target_endpoint, target_endpoint)
         logger.info(
             "prompt_injection_suite: target=%s, system_prompt=%s",
             target_endpoint,
@@ -1163,6 +1204,7 @@ class ToolImplementations:
         result = await self._sandbox_networked.execute_python(
             code=code,
             timeout=300,
+            egress=egress,
         )
         return self._parse_sandbox_result(result)
 
@@ -1258,6 +1300,17 @@ class ToolImplementations:
                 }},
             ]
 
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                \"\"\"A 3xx answer is an error, never a hop to another address.\"\"\"
+
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            # No environment proxies and no redirects: the only reachable peer is
+            # the validated target behind the sandbox's egress forwarder.
+            _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({{}}), _NoRedirect)
+            MAX_BODY_BYTES = 1048576
+
             def query_llm(user_message):
                 \"\"\"Send a prompt to the target LLM endpoint.\"\"\"
                 body = {{"message": user_message}}
@@ -1271,8 +1324,8 @@ class ToolImplementations:
                     method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        return json.loads(resp.read().decode())
+                    with _OPENER.open(req, timeout=15) as resp:
+                        return json.loads(resp.read(MAX_BODY_BYTES).decode())
                 except (urllib.error.URLError, urllib.error.HTTPError, Exception) as e:
                     return {{"error": str(e)}}
 
@@ -1508,6 +1561,7 @@ class ToolImplementations:
                   backoff_seconds: 5
         """)
 
+    @_needs_sandbox
     async def data_quality_check(self, data_path: str) -> dict[str, Any]:
         """Run data quality validation on a dataset."""
         logger.info("data_quality_check: data_path=%s", data_path)
