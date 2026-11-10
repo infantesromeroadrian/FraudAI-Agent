@@ -305,6 +305,67 @@ class RunningVersionLookup(unittest.TestCase):
         self.assertIn("explicit SHA", result.stderr)
 
 
+class DiscoveredContainerFailures(unittest.TestCase):
+    """P1: a container that WAS found but cannot be inspected is an error, not an absence."""
+
+    def two_deployed(self) -> Harness:
+        h = Harness()
+        self.addCleanup(h.dir.cleanup)
+        h.run("deploy.sh", "--ref", "HEAD~1", "--no-frontend")
+        h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        h.log.write_text("")  # only what the next command does is of interest
+        return h
+
+    @staticmethod
+    def mutations(h: Harness) -> list[list]:
+        return [c for c in h.calls() if c[0] == "docker" and (c[1] == "build" or "up" in c[1:4])]
+
+    def test_rollback_aborts_before_mutating_when_the_container_cannot_be_inspected(self) -> None:
+        h = self.two_deployed()
+        before = h.current()["running"]
+        result = h.run(
+            "rollback.sh", SHA_A, STUB_INSPECT_FAIL="1"
+        )  # explicit sha: no selector guard
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot inspect the running API container", result.stderr)
+        self.assertEqual(self.mutations(h), [])
+        self.assertEqual(h.current()["running"], before)
+
+    def test_rollback_aborts_when_the_running_image_has_no_revision(self) -> None:
+        h = self.two_deployed()
+        result = h.run("rollback.sh", SHA_A, STUB_UNLABELLED_RUNNING="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("revision is unknown", result.stderr)
+        self.assertEqual(self.mutations(h), [])
+
+    def test_deploy_aborts_before_any_build_when_the_container_cannot_be_inspected(self) -> None:
+        h = self.two_deployed()
+        result = h.run("deploy.sh", "--ref", "HEAD~1", "--no-frontend", STUB_INSPECT_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot inspect the running API container", result.stderr)
+        self.assertEqual(self.mutations(h), [])
+
+    def test_deploy_aborts_before_any_build_when_the_running_image_has_no_revision(self) -> None:
+        h = self.two_deployed()
+        result = h.run("deploy.sh", "--ref", "HEAD~1", "--no-frontend", STUB_UNLABELLED_RUNNING="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("revision is unknown", result.stderr)
+        self.assertEqual(self.mutations(h), [])
+
+    def test_an_absent_container_is_still_just_absence(self) -> None:
+        h = Harness()
+        self.addCleanup(h.dir.cleanup)
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_general_label_lookup_keeps_its_contract_for_other_callers(self) -> None:
+        # deploy's "reuse only a correctly labelled tag" and rollback's label check still work
+        h = Harness(images={f"fraudai-agent:{SHA_B}": image("c" * 40, "foreign000000")})
+        self.addCleanup(h.dir.cleanup)
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        self.assertIn("refusing to overwrite", result.stderr)
+
+
 class PortResolution(unittest.TestCase):
     """Defect 2: non-secret settings resolve like Compose (process > .env > default)."""
 
@@ -357,6 +418,49 @@ class PortResolution(unittest.TestCase):
         result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(marker.exists(), "the dotenv file must not be evaluated by a shell")
+
+    def refused(self, value: str) -> None:
+        h = self.harness(f"FRAUDAI_PORT={value}\n")
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        self.assertNotEqual(result.returncode, 0, f"{value!r} was accepted")
+        self.assertIn("FRAUDAI_PORT", result.stderr)
+        self.assertEqual(
+            [c for c in h.calls() if c[0] == "docker" and c[1] in {"build", "compose"}], []
+        )
+
+    def accepted_as(self, value: str, expected: str) -> None:
+        h = self.harness(f"FRAUDAI_PORT={value}\n")
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        self.assertEqual(result.returncode, 0, f"{value!r}: " + result.stdout + result.stderr)
+        probes = [c for c in h.calls() if c[0] == "curl"]
+        self.assertTrue(all(f":{expected}/" in c[-2] for c in probes), (value, probes))
+
+    def test_octal_looking_and_overflowing_values_are_refused_before_any_build(self) -> None:
+        for value in (
+            "080000",
+            "18446744073709559616",
+            "0",
+            "00",
+            "65536",
+            "-1",
+            "+80",
+            "1e3",
+            " 80 8",
+        ):
+            with self.subTest(value=value):
+                self.refused(value)
+
+    def test_the_limits_and_valid_leading_zeros_are_accepted_and_normalised(self) -> None:
+        for value, expected in (
+            ("1", "1"),
+            ("65535", "65535"),
+            ("080", "80"),
+            ("00080", "80"),
+            ("0000000000000000000000018080", "18080"),
+            ("09", "9"),
+        ):
+            with self.subTest(value=value):
+                self.accepted_as(value, expected)
 
     def test_invalid_port_is_refused(self) -> None:
         h = self.harness("FRAUDAI_PORT=80;rm\n")

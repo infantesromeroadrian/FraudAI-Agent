@@ -32,6 +32,10 @@ def save(state: dict) -> None:
 
 def fmt_value(fmt: str, image: dict, image_ref: str) -> str:
     if "index .Config.Labels" in fmt:
+        state = load()
+        running = find_image(state, state["running"]) if state.get("running") else None
+        if os.environ.get("STUB_UNLABELLED_RUNNING") and running and running["id"] == image["id"]:
+            return ""  # the running image has no revision label
         return image.get("label", "")
     if ".Id" in fmt:
         return image["id"]
@@ -109,6 +113,9 @@ def docker(args: list[str]) -> int:
                 print(tag.split(":", 1)[1])
         return 0
     if args[0] == "inspect":
+        if os.environ.get("STUB_INSPECT_FAIL"):
+            sys.stderr.write("Error response from daemon: inspect failed (simulated)\n")
+            return 1
         image = find_image(state, state["running"]) if state.get("running") else None
         print(image["id"] if image else "")
         return 0

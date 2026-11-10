@@ -46,12 +46,19 @@ setting() {
 
 # Ports published on 127.0.0.1 (and used for probes, the compiled API URL and the summary).
 resolve_port() {
-    local name="$1" default="$2" value
+    local name="$1" default="$2" value digits
     value="$(setting "$name" "$default")"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > 65535 )); then
-        die "${name} must be a port number between 1 and 65535 (got a different value)."
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        # Leading zeros are removed with string operations (Bash arithmetic would read
+        # "080000" as an invalid octal and overflow on very long numbers), and the length
+        # is bounded before any arithmetic.
+        digits="${value#"${value%%[!0]*}"}"
+        if [[ -n "$digits" && ${#digits} -le 5 ]] && (( 10#$digits >= 1 && 10#$digits <= 65535 )); then
+            printf '%s' "$digits"
+            return 0
+        fi
     fi
-    printf '%s' "$value"
+    die "${name} must be a decimal port number between 1 and 65535 (got a different value)."
 }
 FRAUDAI_PORT="$(resolve_port FRAUDAI_PORT 8000)"
 # shellcheck disable=SC2034  # used by the scripts that source this file
@@ -81,15 +88,29 @@ running_container_id() {
     printf '%s\n' "$out" | head -n 1
 }
 
-# SHA of the image the running API container was created from ("" when not running);
-# returns 2 when the query itself failed.
+# SHA of the image the running API container was created from. Three outcomes, never mixed:
+#   - no container running: prints nothing, returns 0 (genuine absence);
+#   - a container was found but cannot be inspected, or its image cannot: error, returns 2;
+#   - the image carries no revision label: the revision is UNKNOWN, error, returns 3.
+# Unlike image_revision (lenient by design, used for tag checks), nothing is swallowed
+# here: callers abort before building or changing anything.
 running_sha() {
-    local cid img
+    local cid img rev
     cid="$(running_container_id)" || return 2
     [[ -n "$cid" ]] || return 0
-    img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
-    [[ -n "$img" ]] && image_revision "$img"
-    return 0
+    if ! img="$(docker inspect --format '{{.Image}}' "$cid" 2>&1)" || [[ -z "$img" ]]; then
+        log_error "cannot inspect the running API container ${cid}: ${img:-empty image id}"
+        return 2
+    fi
+    if ! rev="$(docker image inspect --format "{{ index .Config.Labels \"${REVISION_LABEL}\" }}" "$img" 2>&1)"; then
+        log_error "cannot inspect the image of the running API container ${cid}: ${rev}"
+        return 2
+    fi
+    if [[ -z "$rev" ]]; then
+        log_error "the running API image's revision is unknown: it has no ${REVISION_LABEL} label."
+        return 3
+    fi
+    printf '%s\n' "$rev"
 }
 
 # JSON field of GET /api/v1/readyz (first argument = field name). The body is parsed even
