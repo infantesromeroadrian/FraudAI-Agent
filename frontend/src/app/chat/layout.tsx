@@ -5,6 +5,8 @@ import type { AgentName } from "@/lib/types";
 import { useSession } from "@/hooks/useSession";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Header } from "@/components/layout/Header";
+import { AuthGate } from "@/components/auth/AuthGate";
+import { logout } from "@/lib/api";
 
 /**
  * Chat layout: sidebar + header + content area.
@@ -17,6 +19,14 @@ export default function ChatLayout({
 }: {
   children: React.ReactNode;
 }) {
+  return (
+    <AuthGate>
+      <ChatShell>{children}</ChatShell>
+    </AuthGate>
+  );
+}
+
+function ChatShell({ children }: { children: React.ReactNode }) {
   const {
     sessions,
     health,
@@ -76,6 +86,7 @@ export default function ChatLayout({
           sessionId={currentSessionId}
           currentAgent={currentAgent}
           selectedAgent={selectedAgent}
+          onLogout={logout}
         />
         <div className="flex-1 overflow-hidden">{children}</div>
       </main>
