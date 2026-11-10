@@ -50,6 +50,7 @@ export function ChatWindow() {
           isSubmitting={isConfirming}
           error={confirmError}
           notice={confirmNotice}
+          decisionsBlocked={isStreaming}
           onDecision={(approved) => void confirmPending(approved)}
         />
       )}

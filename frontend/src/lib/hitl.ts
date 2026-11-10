@@ -73,6 +73,7 @@ export async function resolvePending(
 /**
  * Explicit failure text for a tool that ended in status "error", e.g.
  * result={status,error_code,error} when the sandbox is disabled/unavailable.
+ * "Not executed" is stated only for sandbox_disabled/sandbox_unavailable.
  * Returns null for non-failures.
  */
 export function describeToolFailure(tool: ToolResult): string | null {
@@ -80,7 +81,13 @@ export function describeToolFailure(tool: ToolResult): string | null {
   const r = (tool.result ?? {}) as Record<string, unknown>;
   const code = typeof r.error_code === "string" ? r.error_code : "unknown_error";
   const detail = typeof r.error === "string" ? r.error : "No further detail.";
-  return `Tool "${tool.tool_name}" failed (${code}): ${detail} The action was not executed.`;
+  // Only these explicit codes prove nothing ran. Any other failure (e.g. a
+  // sandbox error after the container started) may have had effects.
+  const notExecuted = code === "sandbox_disabled" || code === "sandbox_unavailable";
+  const outcome = notExecuted
+    ? "The action was not executed."
+    : "Whether the action ran is unknown: effects on the target cannot be ruled out. Verify before retrying.";
+  return `Tool "${tool.tool_name}" failed (${code}): ${detail} ${outcome}`;
 }
 
 /** Plain-text rendering of model-supplied arguments (never HTML/markdown). */

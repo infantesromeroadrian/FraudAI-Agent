@@ -15,6 +15,13 @@ import {
 } from "@/lib/api";
 import { onSessionCleared } from "@/lib/auth";
 import { resolvePending } from "@/lib/hitl";
+import {
+  canDecide,
+  initialPendingState,
+  pendingReducer,
+  type PendingAction_,
+  type PendingState,
+} from "@/lib/pending";
 
 // ---------------------------------------------------------------------------
 // Unique ID generator (avoids crypto dep in client components)
@@ -36,12 +43,18 @@ function assistantNote(content: string, agent?: string): Message {
 
 export function useChat() {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [currentAgent, setCurrentAgent] = useState<AgentName | null>(null);
-  // F4: the server is paused until this exact action is approved/rejected.
-  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
-  const [isConfirming, setIsConfirming] = useState(false);
+  // F4: pending/streaming/confirming live in one reducer (lib/pending.ts) so
+  // an old SSE turn can never restore or replace an already-decided action.
+  // The ref mirrors the state synchronously for guards inside callbacks.
+  const [pendingState, setPendingState] = useState<PendingState>(initialPendingState);
+  const stateRef = useRef<PendingState>(initialPendingState);
+  const dispatch = useCallback((a: PendingAction_) => {
+    stateRef.current = pendingReducer(stateRef.current, a);
+    setPendingState(stateRef.current);
+  }, []);
+  const { pending: pendingAction, streaming: isStreaming, confirming: isConfirming } = pendingState;
   const [confirmError, setConfirmError] = useState<string | null>(null);
   const [confirmNotice, setConfirmNotice] = useState<string | null>(null);
 
@@ -49,15 +62,8 @@ export function useChat() {
   const streamBufferRef = useRef<string>("");
   const rafRef = useRef<number | null>(null);
   const assistantIdRef = useRef<string>("");
-  const confirmingRef = useRef(false);
-  const pendingRef = useRef<PendingAction | null>(null);
   // Bumped whenever state of a previous session/user must be discarded.
   const generationRef = useRef(0);
-
-  const setPending = useCallback((p: PendingAction | null) => {
-    pendingRef.current = p;
-    setPendingAction(p);
-  }, []);
 
   const stopRaf = useCallback(() => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -71,17 +77,13 @@ export function useChat() {
     abortRef.current?.abort();
     abortRef.current = null;
     streamBufferRef.current = "";
-    confirmingRef.current = false;
-    pendingRef.current = null;
+    dispatch({ type: "reset" });
     setMessages([]);
     setSessionId(null);
     setCurrentAgent(null);
-    setIsStreaming(false);
-    setPendingAction(null);
-    setIsConfirming(false);
     setConfirmError(null);
     setConfirmNotice(null);
-  }, [stopRaf]);
+  }, [stopRaf, dispatch]);
 
   // 401 / logout: cancel stream and clear sessions + pending.
   useEffect(() => {
@@ -102,7 +104,7 @@ export function useChat() {
     async (content: string, agentOverride?: AgentName) => {
       // While an action awaits approval the server rejects chat (409): the
       // decision must come first, and a message never approves anything.
-      if (!content.trim() || isStreaming || pendingRef.current) return;
+      if (!content.trim() || stateRef.current.streaming || stateRef.current.pending) return;
 
       const gen = generationRef.current;
       const alive = () => generationRef.current === gen;
@@ -129,7 +131,7 @@ export function useChat() {
         },
       ]);
 
-      setIsStreaming(true);
+      dispatch({ type: "stream_start" });
       streamBufferRef.current = "";
       assistantIdRef.current = assistantId;
 
@@ -151,7 +153,7 @@ export function useChat() {
 
       const finish = () => {
         stopRaf();
-        setIsStreaming(false);
+        dispatch({ type: "stream_end" });
         abortRef.current = null;
       };
 
@@ -199,7 +201,7 @@ export function useChat() {
             if (!alive()) return;
             setConfirmError(null);
             setConfirmNotice(null);
-            setPending(pending);
+            dispatch({ type: "stream_pending", pending });
             if (recovered) {
               // 409: the message was discarded by the server; no `done` follows.
               finish();
@@ -224,7 +226,6 @@ export function useChat() {
 
             setSessionId(response.session_id);
             setCurrentAgent(response.agent as AgentName);
-            if (response.pending_action) setPending(response.pending_action);
 
             const finalContent = streamBufferRef.current || response.message || "No response generated.";
             setMessages((prev) =>
@@ -242,7 +243,7 @@ export function useChat() {
                   : m,
               ),
             );
-            setIsStreaming(false);
+            dispatch({ type: "stream_done", pending: response.pending_action ?? null });
             abortRef.current = null;
           },
           // stop RAF, show error
@@ -268,7 +269,7 @@ export function useChat() {
 
       abortRef.current = controller;
     },
-    [isStreaming, sessionId, setPending, stopRaf],
+    [sessionId, dispatch, stopRaf],
   );
 
   // -----------------------------------------------------------------------
@@ -316,25 +317,22 @@ export function useChat() {
 
   const confirmPending = useCallback(
     async (approved: boolean) => {
-      const pending = pendingRef.current;
-      if (!pending || !sessionId || confirmingRef.current) return;
+      const pending = stateRef.current.pending;
+      // Not while the SSE turn is open, not twice, never without a pending.
+      if (!pending || !sessionId || !canDecide(stateRef.current)) return;
 
       const gen = generationRef.current;
-      confirmingRef.current = true;
-      setIsConfirming(true);
+      dispatch({ type: "decision_start" });
       setConfirmError(null);
       setConfirmNotice(null);
 
       const outcome = await resolvePending(sessionId, pending.action_id, approved);
       if (generationRef.current !== gen) return; // session ended meanwhile
 
-      confirmingRef.current = false;
-      setIsConfirming(false);
-
       switch (outcome.kind) {
         case "answer": {
           const r = outcome.response;
-          setPending(null);
+          dispatch({ type: "decision_result", pending: null });
           setCurrentAgent(r.agent as AgentName);
           setMessages((prev) => [
             ...prev,
@@ -352,7 +350,7 @@ export function useChat() {
           break;
         }
         case "next":
-          setPending(outcome.pending);
+          dispatch({ type: "decision_result", pending: outcome.pending });
           setConfirmNotice(
             approved
               ? "Decision recorded. Another action now needs your approval."
@@ -360,15 +358,15 @@ export function useChat() {
           );
           break;
         case "no_pending":
-          setPending(null);
+          dispatch({ type: "decision_result", pending: null });
           setMessages((prev) => [...prev, assistantNote(outcome.message)]);
           break;
         case "stale":
-          setPending(outcome.pending);
+          dispatch({ type: "decision_result", pending: outcome.pending });
           setConfirmError(outcome.message);
           break;
         case "session_lost":
-          setPending(null);
+          dispatch({ type: "decision_result", pending: null });
           setSessionId(null);
           setMessages((prev) => [...prev, assistantNote(outcome.message)]);
           break;
@@ -377,11 +375,12 @@ export function useChat() {
           break;
         case "error":
           // Action stays pending; user may retry the same explicit decision.
+          dispatch({ type: "decision_result", pending: "keep" });
           setConfirmError(outcome.message);
           break;
       }
     },
-    [sessionId, setPending],
+    [sessionId, dispatch],
   );
 
   // -----------------------------------------------------------------------
@@ -410,11 +409,11 @@ export function useChat() {
     stopRaf();
     abortRef.current?.abort();
     abortRef.current = null;
-    setIsStreaming(false);
+    dispatch({ type: "stream_end" });
     setMessages((prev) =>
       prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false, content: streamBufferRef.current || m.content } : m)),
     );
-  }, [stopRaf]);
+  }, [stopRaf, dispatch]);
 
   return {
     messages,
