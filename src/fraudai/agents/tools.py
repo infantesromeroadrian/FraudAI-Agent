@@ -165,7 +165,8 @@ def create_search_boe(retriever: LegalRetriever) -> Any:
             norma_titulo, articulo, score, fecha_publicacion,
             estado_consolidacion, collection.
         """
-        logger.info("search_boe called: query=%r, k=%d, filters=%s", query, k, filters)
+        # The query is user text: DEBUG only, so INFO logs never carry it.
+        logger.debug("search_boe called: query=%r, k=%d, filters=%s", query, k, filters)
         results = await retriever.retrieve(query, k=k, filters=filters)
         citations = retriever.format_citations(results)
         logger.info("search_boe returning %d citations", len(citations))

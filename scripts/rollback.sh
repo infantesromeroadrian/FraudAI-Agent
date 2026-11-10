@@ -1,186 +1,82 @@
 #!/usr/bin/env bash
 # =============================================================================
-# FraudAI Agent -- Rollback Script
+# FraudAI Agent -- roll the API back to an image that already exists locally.
 #
-# Usage:
-#   ./scripts/rollback.sh <image-tag>
-#   ./scripts/rollback.sh rollback-20260406_143000
-#   ./scripts/rollback.sh --list   # List available rollback tags
+# Usage: ./scripts/rollback.sh <sha|--previous>
+#        ./scripts/rollback.sh --list
 #
-# Steps:
-#   1. Validate the rollback tag exists
-#   2. Stop current FraudAI Agent service
-#   3. Re-tag the rollback image as :latest
-#   4. Start services with the restored image
-#   5. Verify health
-#
-# Reference: ADR-006
+# Rolling back never builds, re-tags or deletes anything: it points the API
+# container at fraudai-agent:<sha> (built earlier by deploy.sh) and then verifies
+# that the container runs that image and that the API serves that same SHA
+# (build_sha on /api/v1/readyz); that check cannot be skipped.
 # =============================================================================
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-COMPOSE_FILE="${PROJECT_DIR}/docker-compose.prod.yml"
+TARGET=""
+LIST=false
 
-MAX_RETRIES=30
-RETRY_INTERVAL=2
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list) LIST=true; shift ;;
+        --previous) TARGET="--previous"; shift ;;
+        --help|-h) sed -n '2,14p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -*) die "Unknown argument: $1" ;;
+        *) TARGET="$1"; shift ;;
+    esac
+done
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+command -v docker >/dev/null || die "docker is not installed."
+[[ -f "$ENV_FILE" ]] || die "Env file not found: ${ENV_FILE}."
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-log_info()  { echo -e "${GREEN}[+]${NC} $*"; }
-log_warn()  { echo -e "${YELLOW}[~]${NC} $*"; }
-log_error() { echo -e "${RED}[!]${NC} $*"; }
-
-wait_for_healthy() {
-    local service_name="$1"
-    local url="$2"
-    local retries="${3:-$MAX_RETRIES}"
-
-    log_warn "Waiting for ${service_name} to be healthy..."
-    for i in $(seq 1 "$retries"); do
-        if curl -sf "$url" > /dev/null 2>&1; then
-            log_info "${service_name} is healthy."
-            return 0
-        fi
-        if [[ $i -eq $retries ]]; then
-            log_error "${service_name} failed to become healthy after $((retries * RETRY_INTERVAL))s."
-            return 1
-        fi
-        sleep "$RETRY_INTERVAL"
+if [[ "$LIST" == "true" ]]; then
+    echo "Local ${API_REPO} images by commit (revision label):"
+    docker image ls "$API_REPO" --format '{{.Tag}}' | grep -E '^[0-9a-f]{40}$' | while read -r tag; do
+        printf '  %s  %s  %s\n' "$tag" "$(image_id "${API_REPO}:${tag}" | cut -c8-19)" \
+            "$(docker image inspect --format '{{.Created}}' "${API_REPO}:${tag}")"
     done
-}
-
-usage() {
-    echo "Usage: $0 <rollback-tag>"
-    echo "       $0 --list"
-    echo ""
-    echo "Arguments:"
-    echo "  <rollback-tag>  Docker image tag to restore (e.g., rollback-20260406_143000)"
-    echo "  --list          List all available rollback tags"
-    echo ""
-    echo "Example:"
-    echo "  $0 rollback-20260406_143000"
-}
-
-# ---------------------------------------------------------------------------
-# Parse arguments
-# ---------------------------------------------------------------------------
-
-if [[ $# -lt 1 ]]; then
-    log_error "Missing required argument: rollback tag."
-    echo ""
-    usage
-    exit 1
+    exit 0
 fi
 
-case "$1" in
-    --list)
-        echo "Available rollback tags for fraudai-agent:"
-        echo ""
-        docker images fraudai-agent --format "  {{.Tag}}\t{{.CreatedAt}}\t{{.Size}}" | grep "rollback-" || {
-            echo "  (no rollback tags found)"
-        }
-        exit 0
-        ;;
-    --help|-h)
-        usage
-        exit 0
-        ;;
-    *)
-        ROLLBACK_TAG="$1"
-        ;;
-esac
+[[ -n "$TARGET" ]] || die "Missing target: pass a commit SHA, --previous or --list."
 
-# ---------------------------------------------------------------------------
-# 0. Validate
-# ---------------------------------------------------------------------------
-
-cd "$PROJECT_DIR"
-
-FULL_IMAGE="fraudai-agent:${ROLLBACK_TAG}"
-
-log_info "Validating rollback image: ${FULL_IMAGE}..."
-
-if ! docker image inspect "$FULL_IMAGE" &> /dev/null 2>&1; then
-    log_error "Image not found: ${FULL_IMAGE}"
-    log_error "Available tags:"
-    docker images fraudai-agent --format "  {{.Tag}}\t{{.CreatedAt}}" | head -10
-    exit 1
+CURRENT_SHA="$(running_sha)" || die "Cannot determine the version that is running now; refusing to guess."
+if [[ "$TARGET" == "--previous" ]]; then
+    [[ -n "$CURRENT_SHA" ]] || die "Nothing is running, so there is no \"previous\" to go back from: pass an explicit SHA (see --list)."
+    TARGET="$(previous_recorded_sha "$CURRENT_SHA")"
+    [[ -n "$TARGET" ]] || die "No previous deployment recorded in ${STATE_LOG}."
 fi
 
-log_info "Rollback image found: ${FULL_IMAGE}"
+if ! is_full_sha "$TARGET"; then
+    # allow an unambiguous prefix of a locally built tag
+    matches="$(docker image ls "$API_REPO" --format '{{.Tag}}' | grep -E "^${TARGET}[0-9a-f]*$" | grep -E '^[0-9a-f]{40}$' || true)"
+    [[ "$(echo "$matches" | grep -c .)" == "1" ]] || die "'${TARGET}' does not identify exactly one local image (use --list)."
+    TARGET="$matches"
+fi
+SHA="$TARGET"
+IMAGE="${API_REPO}:${SHA}"
 
-# ---------------------------------------------------------------------------
-# 1. Save current :latest tag as pre-rollback backup
-# ---------------------------------------------------------------------------
+docker image inspect "$IMAGE" >/dev/null 2>&1 || die "Image ${IMAGE} not found locally (see --list)."
+[[ "$(image_revision "$IMAGE")" == "$SHA" ]] ||
+    die "${IMAGE} does not carry revision ${SHA} in its label; refusing to roll back to a mislabelled image."
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-if docker image inspect fraudai-agent:latest &> /dev/null 2>&1; then
-    docker tag fraudai-agent:latest "fraudai-agent:pre-rollback-${TIMESTAMP}"
-    log_info "Current :latest backed up as fraudai-agent:pre-rollback-${TIMESTAMP}"
+log_info "Rolling back: ${CURRENT_SHA:-<not running>} -> ${SHA}"
+export FRAUDAI_IMAGE="$IMAGE"
+# The frontend image is only touched when one was built for that commit.
+SERVICES=(fraudai)
+if docker image inspect "${FRONTEND_REPO}:${SHA}" >/dev/null 2>&1; then
+    export FRONTEND_IMAGE="${FRONTEND_REPO}:${SHA}"
+    SERVICES+=(frontend)
+else
+    export FRONTEND_IMAGE="${FRONTEND_IMAGE:-${FRONTEND_REPO}:none}"
+    log_warn "No ${FRONTEND_REPO}:${SHA}; the frontend container is left as it is."
 fi
 
-# ---------------------------------------------------------------------------
-# 2. Stop current FraudAI Agent service (keep infra services running)
-# ---------------------------------------------------------------------------
+compose up -d --no-deps "${SERVICES[@]}"
+wait_for_ready 90 || { compose logs --tail 40 fraudai >&2; die "API did not become ready after rollback."; }
+verify_running_sha "$SHA" || die "Rollback verification failed."
 
-log_info "Stopping FraudAI Agent service..."
-docker compose -f "$COMPOSE_FILE" stop fraudai
-docker compose -f "$COMPOSE_FILE" rm -f fraudai
-log_info "FraudAI Agent stopped."
-
-# ---------------------------------------------------------------------------
-# 3. Re-tag the rollback image as :latest
-# ---------------------------------------------------------------------------
-
-log_info "Restoring image: ${FULL_IMAGE} -> fraudai-agent:latest"
-docker tag "$FULL_IMAGE" fraudai-agent:latest
-log_info "Image re-tagged."
-
-# ---------------------------------------------------------------------------
-# 4. Start services with restored image
-# ---------------------------------------------------------------------------
-
-log_info "Starting FraudAI Agent with restored image..."
-docker compose -f "$COMPOSE_FILE" up -d fraudai
-log_info "FraudAI Agent started."
-
-# ---------------------------------------------------------------------------
-# 5. Verify health
-# ---------------------------------------------------------------------------
-
-FRAUDAI_PORT="${FRAUDAI_PORT:-8000}"
-
-# Infrastructure should already be running
-wait_for_healthy "Qdrant" "http://localhost:6333/healthz" 10
-wait_for_healthy "Ollama" "http://localhost:11434/api/tags" 10
-wait_for_healthy "FraudAI Agent" "http://localhost:${FRAUDAI_PORT}/api/v1/health" "$MAX_RETRIES"
-
-# Smoke test
-HEALTH_RESPONSE=$(curl -sf "http://localhost:${FRAUDAI_PORT}/api/v1/health" 2>&1) || {
-    log_error "Rollback verification FAILED. Health endpoint not reachable."
-    log_error "Check logs: docker compose -f $COMPOSE_FILE logs fraudai"
-    exit 1
-}
-
-echo ""
-echo "============================================"
-echo "  Rollback Complete"
-echo "============================================"
-echo "  Restored image : ${FULL_IMAGE}"
-echo "  Pre-rollback   : fraudai-agent:pre-rollback-${TIMESTAMP}"
-echo "  Health status  :"
-echo "$HEALTH_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$HEALTH_RESPONSE"
-echo "============================================"
+record_state rollback "$SHA" "${CURRENT_SHA:-}" "$(image_id "$IMAGE")"
+log_info "Rollback complete: serving ${SHA}. The image of ${CURRENT_SHA:-the replaced deployment} is untouched."

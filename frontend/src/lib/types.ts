@@ -35,6 +35,17 @@ export interface ResponseMetadata {
   corpus_version: string;
 }
 
+/** Per-call human approval request (F4 contract). Model-originated: render as plain text. */
+export interface PendingAction {
+  kind: "offensive_tool_approval";
+  action_id: string;
+  agent: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  target: string | null;
+  warning?: string | null;
+}
+
 export interface ChatResponse {
   session_id: string;
   agent: string;
@@ -42,6 +53,14 @@ export interface ChatResponse {
   citations: Citation[];
   tool_results: ToolResult[];
   metadata: ResponseMetadata;
+  /** Always present from the server; null when not paused. */
+  pending_action?: PendingAction | null;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
 }
 
 // --- File Upload ---
@@ -187,6 +206,7 @@ export const AGENTS: Record<AgentName, AgentInfo> = {
 
 export type SSEEventType =
   | "token"
+  | "pending_action"
   | "tool_start"
   | "tool_result"
   | "done"
@@ -207,6 +227,11 @@ export interface SSEToolResultEvent {
   tool_result: ToolResult;
 }
 
+export interface SSEPendingActionEvent {
+  type: "pending_action";
+  pending_action: PendingAction;
+}
+
 export interface SSEDoneEvent {
   type: "done";
   response: ChatResponse;
@@ -215,11 +240,13 @@ export interface SSEDoneEvent {
 export interface SSEErrorEvent {
   type: "error";
   message: string;
+  code?: string;
 }
 
 export type SSEEvent =
   | SSETokenEvent
   | SSEToolStartEvent
   | SSEToolResultEvent
+  | SSEPendingActionEvent
   | SSEDoneEvent
   | SSEErrorEvent;

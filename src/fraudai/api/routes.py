@@ -21,16 +21,30 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakValueDictionary
 
-import httpx as httpx_client
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from fraudai.agents.hitl import APPROVAL_KIND
-from fraudai.api.auth import User, create_token, get_admin_user, get_current_user
+from fraudai.api import auth as auth_module
+from fraudai.api.auth import (
+    MAX_USERNAME_LENGTH,
+    User,
+    check_credentials,
+    create_token,
+    credentials_from_settings,
+    get_current_user,
+    require_metrics_access,
+)
+from fraudai.api.health import (
+    HealthDetailResponse,
+    ReadinessResponse,
+    health_view,
+    readiness_view,
+)
 from fraudai.api.schemas import (
     ChatRequest,
     ChatResponse,
@@ -38,7 +52,6 @@ from fraudai.api.schemas import (
     ConfirmationRequest,
     FeedbackRequest,
     FileUploadResponse,
-    HealthResponse,
     PendingAction,
     ResponseMetadata,
     SessionInfo,
@@ -57,6 +70,7 @@ if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
     from langgraph.graph.state import CompiledStateGraph
 
+    from fraudai.api.health import HealthMonitor
     from fraudai.api.session_manager import SessionManager
     from fraudai.rag.qdrant_store import QdrantStore
 
@@ -144,6 +158,32 @@ async def require_session_owner(
     Routes that carry it in the body call ``_owned_session`` first instead.
     """
     return _owned_session(_get_session_manager(request), session_id, user)
+
+
+async def enforce_rate_limit(
+    request: Request,
+    user: User = Depends(get_current_user),
+) -> None:
+    """Per-tenant request budget for the expensive routes (chat, stream, confirm, upload).
+
+    Runs after authentication, so anonymous traffic cannot spend a tenant's budget, and
+    before any session lookup or graph work. An app without ``rate_limiter`` in its state
+    is not limited; the production factory always installs one.
+
+    Raises:
+        HTTPException 429: budget exhausted, with ``Retry-After`` in seconds.
+    """
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is None:
+        return
+    retry_after = limiter.check(user.tenant_id)
+    if retry_after is not None:
+        logger.warning("rate_limited: tenant=%s, user=%s", user.tenant_id, user.user_id)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 def _resolve_chat_session(
@@ -305,42 +345,81 @@ def _chat_response(
 # ---------------------------------------------------------------------------
 
 
+def _invalid_credentials() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Incorrect username or password.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @router.post("/auth/token", response_model=TokenResponse)
 async def login(
-    username: str = Form(),
-    password: str = Form(),
+    # Default "": an empty or missing field must reach the handler and get the same 401 as
+    # wrong credentials, instead of FastAPI's 422 for an "absent" empty form value.
+    username: str = Form(default=""),
+    password: str = Form(default=""),
 ) -> TokenResponse:
-    """Issue a JWT access token via OAuth2 password grant.
+    """Issue a JWT access token via OAuth2 password grant (D5, minimal local login).
 
-    **MVP behaviour:**
-    In the ``development`` environment only, any credentials are accepted
-    and a valid JWT is returned.  This lets the frontend and integration
-    tests obtain real tokens without a user store.
+    The user is configured on the server (``AUTH_USERNAME`` / ``AUTH_PASSWORD_HASH`` and
+    optionally tenant, tier and admin flag). Identity and tier come from that configuration,
+    never from the request. Empty credentials are always rejected.
 
-    In ``staging`` and ``production``, returns HTTP 501 until a proper user
-    store is wired (Phase F5).
+    - 200: token. 401: wrong or empty credentials. 429: too many recent failures for that
+      username (``Retry-After``). 503: staging/production without a configured login.
+    - ``development`` with no ``AUTH_*`` configured keeps the open login (any non-empty
+      credentials) so the frontend and tests work without a user store; once ``AUTH_*`` is
+      configured it is enforced in every environment.
 
-    The returned token can be passed as ``Authorization: Bearer <token>``
-    to all authenticated endpoints.
+    The token goes in ``Authorization: Bearer <token>``; the client keeps it in memory only
+    and logs in again on 401.
     """
     from fraudai.api.auth import JWT_EXPIRATION_HOURS
 
-    if settings.environment == "development":
+    creds = credentials_from_settings(settings)
+    open_dev_login = creds is None and settings.environment == "development"
+    if creds is None and not open_dev_login:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Login is not configured on this server.",
+        )
+    if not username or not password or len(username) > MAX_USERNAME_LENGTH:
+        raise _invalid_credentials()
+
+    throttle = auth_module.login_throttle
+    retry_after = throttle.retry_after(username)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if creds is not None:
+        # scrypt is deliberately slow: keep it off the event loop.
+        if not await asyncio.to_thread(check_credentials, creds, username, password):
+            throttle.record_failure(username)
+            logger.warning("login_failed: attempts_tracked=%d", throttle.tracked_count())
+            raise _invalid_credentials()
+        token = create_token(
+            user_id=creds.username,
+            tenant_id=creds.tenant_id,
+            tier=creds.tier,
+            is_admin=creds.is_admin,
+        )
+    else:
         token = create_token(
             user_id=username,
             tenant_id="default",
             tier="enterprise",
             email=f"{username}@fraudai.local",
         )
-        return TokenResponse(
-            access_token=token,
-            token_type="bearer",
-            expires_in=JWT_EXPIRATION_HOURS * 3600,
-        )
-
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Production authentication not configured.",
+    throttle.reset(username)
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=JWT_EXPIRATION_HOURS * 3600,
     )
 
 
@@ -354,6 +433,7 @@ async def chat(
     request_body: ChatRequest,
     request: Request,
     user: User = Depends(get_current_user),
+    _budget: None = Depends(enforce_rate_limit),
 ) -> ChatResponse:
     """Send a message to FraudAI. Routes via Donna to the appropriate agent.
 
@@ -433,6 +513,7 @@ async def chat_stream(
     request_body: ChatRequest,
     request: Request,
     user: User = Depends(get_current_user),
+    _budget: None = Depends(enforce_rate_limit),
 ) -> StreamingResponse:
     """SSE streaming endpoint for real-time agent responses.
 
@@ -588,9 +669,14 @@ async def chat_stream(
             done_payload = {"type": "done", "response": done_response}
             yield f"data: {json.dumps(done_payload)}\n\n"
 
-        except Exception as exc:
+        except Exception:
             logger.exception("Stream error for session %s", session_id)
-            error_payload = {"type": "error", "message": str(exc)}
+            # The cause stays in the server log; clients get a generic, stable payload.
+            error_payload = {
+                "type": "error",
+                "code": "agent_error",
+                "message": "Agent processing failed. Please try again.",
+            }
             yield f"data: {json.dumps(error_payload)}\n\n"
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -706,6 +792,7 @@ _UPLOAD_OPENAPI = {
 @router.post("/files/upload", response_model=FileUploadResponse, openapi_extra=_UPLOAD_OPENAPI)
 async def upload_file(
     request: Request,
+    _budget: None = Depends(enforce_rate_limit),
     session: SessionData = Depends(require_session_owner),
 ) -> FileUploadResponse:
     """Upload a document for session context.
@@ -926,6 +1013,7 @@ async def confirm_action(
     request_body: ConfirmationRequest,
     request: Request,
     user: User = Depends(get_current_user),
+    _budget: None = Depends(enforce_rate_limit),
 ) -> ChatResponse:
     """Approve or reject ONE pending offensive tool call (Mike Ross HITL).
 
@@ -1017,6 +1105,22 @@ async def submit_feedback(
         "tenant_id": user.tenant_id,
         "timestamp": datetime.now(UTC).isoformat(),
     }
+    db = getattr(request.app.state, "db", None)
+    if db is not None:
+        try:
+            await db.save_feedback(
+                request_body.session_id,
+                request_body.message_id,
+                user.user_id,
+                request_body.rating,
+                request_body.comment,
+            )
+        except Exception as exc:  # boundary: any storage failure becomes one stable 503
+            logger.exception("Feedback persistence failed")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Feedback could not be stored.",
+            ) from exc
     feedback_store.append(entry)
 
     logger.info(
@@ -1034,85 +1138,45 @@ async def submit_feedback(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/health", response_model=HealthResponse)
-async def health(request: Request) -> HealthResponse:
-    """Health check for all FraudAI infrastructure components.
+def _get_health_monitor(request: Request) -> HealthMonitor | None:
+    monitor: HealthMonitor | None = getattr(request.app.state, "health_monitor", None)
+    return monitor
 
-    Checks connectivity to:
-    - Qdrant (vector DB)
-    - Ollama (local LLM for Donna)
-    - Anthropic Claude API (remote LLM for agents)
 
-    Returns overall status: 'healthy', 'degraded', or 'unhealthy'.
-    No authentication required -- used by load balancers and monitoring.
+@router.get("/livez")
+async def livez() -> dict[str, str]:
+    """Liveness: the process answers. Touches no dependency, so it never flaps with them."""
+    return {"status": "alive"}
+
+
+@router.get(
+    "/readyz",
+    response_model=ReadinessResponse,
+    responses={503: {"model": ReadinessResponse}},
+)
+async def readyz(request: Request) -> JSONResponse:
+    """Readiness from the cached dependency snapshot: 200 when ready, 503 otherwise.
+
+    ``starting`` (503) until the first check completes; a snapshot that stops refreshing
+    expires. No outbound call happens while answering. ``build_sha`` identifies the image.
     """
-    store = _get_store(request)
-
-    # Check Qdrant
-    qdrant_ok = False
-    try:
-        qdrant_ok = await store.health_check()
-    except Exception:
-        logger.warning("Qdrant health check failed")
-
-    # Check Ollama
-    ollama_ok = False
-    try:
-        async with httpx_client.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{settings.ollama_host}/api/tags")
-            ollama_ok = resp.status_code == 200
-    except Exception:
-        logger.warning("Ollama health check failed")
-
-    # Check LLM API (Anthropic, Groq, or OpenAI)
-    llm_ok = False
-    try:
-        provider = settings.llm_provider
-        if provider == "groq" and settings.groq_api_key:
-            async with httpx_client.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    "https://api.groq.com/openai/v1/models",
-                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-                )
-                llm_ok = resp.status_code == 200
-        elif provider == "anthropic" and settings.anthropic_api_key:
-            async with httpx_client.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": settings.anthropic_api_key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                )
-                llm_ok = resp.status_code in (200, 405)
-        else:
-            logger.warning("LLM API key not configured for provider '%s'", provider)
-    except Exception:
-        logger.warning("LLM API health check failed for provider '%s'", settings.llm_provider)
-
-    # Get corpus version
-    corpus_version: str | None = None
-    try:
-        corpus_version = await store.get_corpus_version()
-    except Exception:
-        logger.warning("Failed to retrieve corpus version")
-
-    # Determine overall status
-    checks = [qdrant_ok, ollama_ok, llm_ok]
-    if all(checks):
-        overall = "healthy"
-    elif any(checks):
-        overall = "degraded"
-    else:
-        overall = "unhealthy"
-
-    return HealthResponse(
-        status=overall,
-        qdrant=qdrant_ok,
-        ollama=ollama_ok,
-        claude_api=llm_ok,
-        corpus_version=corpus_version,
+    body = readiness_view(_get_health_monitor(request), settings)
+    return JSONResponse(
+        status_code=200 if body.status == "ready" else 503,
+        content=body.model_dump(),
     )
+
+
+@router.get("/health", response_model=HealthDetailResponse)
+async def health(request: Request) -> HealthDetailResponse:
+    """Dependency health from the cached snapshot (same data as ``/readyz``).
+
+    Keeps the original fields; ``status`` is 'healthy' (all three components up),
+    'degraded' (some) or 'unhealthy' (none, including before the first check, when
+    ``checked_at`` is null). Always HTTP 200: use ``/readyz`` for gating.
+    No authentication and no outbound calls.
+    """
+    return health_view(_get_health_monitor(request), settings)
 
 
 # ---------------------------------------------------------------------------
@@ -1120,10 +1184,8 @@ async def health(request: Request) -> HealthResponse:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/admin/metrics")
-async def metrics(
-    user: User = Depends(get_admin_user),
-) -> Response:
+@router.get("/admin/metrics", dependencies=[Depends(require_metrics_access)])
+async def metrics() -> Response:
     """Prometheus-compatible metrics endpoint.
 
     Exposes:
@@ -1133,7 +1195,7 @@ async def metrics(
     - RAG retrieval latency and cache hit rate
     - Active sessions and concurrent users
 
-    Requires admin privileges.
+    Requires the dedicated scrape credential or an admin JWT.
     """
     from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 

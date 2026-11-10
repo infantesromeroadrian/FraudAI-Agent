@@ -1,13 +1,17 @@
 # =============================================================================
-# Prometheus Configuration — FraudAI Agent
+# Prometheus Configuration — FraudAI Agent (local compose)
 #
-# Scrape targets:
-#   - fraudai: Main application metrics (auth required)
-#   - qdrant:  Vector database metrics
-#   - ollama:  Local LLM metrics
-#   - prometheus: Self-monitoring
+# Scrape targets (only things that really expose Prometheus metrics):
+#   - fraudai:    application metrics (dedicated scrape credential, metrics-only)
+#   - qdrant:     vector database metrics
+#   - prometheus: self-monitoring
+# Ollama is NOT scraped: the daemon does not expose a Prometheus endpoint. Its
+# availability is reported by the API health endpoint, not by this file.
 #
-# Alert rules loaded from /etc/prometheus/rules/*.yml
+# Alert rules are loaded from /etc/prometheus/rules/*.yml and evaluated here.
+# There is NO Alertmanager in this stack: alerts are visible in the Prometheus UI
+# (Alerts tab) but nothing is notified. Add an `alerting:` block only together with
+# a real Alertmanager deployment.
 # =============================================================================
 
 global:
@@ -18,18 +22,6 @@ global:
 rule_files:
   - /etc/prometheus/rules/*.yml
 
-# ---------------------------------------------------------------------------
-# Alertmanager (optional — configure when Alertmanager is deployed)
-# ---------------------------------------------------------------------------
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets:
-#             - alertmanager:9093
-
-# ---------------------------------------------------------------------------
-# Scrape Configurations
-# ---------------------------------------------------------------------------
 scrape_configs:
   # --- FraudAI Application ---
   - job_name: fraudai
@@ -38,10 +30,12 @@ scrape_configs:
     static_configs:
       - targets: ["fraudai:8000"]
         labels:
-          environment: production
-    # Admin endpoint requires authentication (SR-012)
-    # Token mounted as file to avoid hardcoding secrets
-    bearer_token_file: /etc/prometheus/fraudai_token
+          environment: local
+    # The dedicated metrics-only credential (F5c), written at start by entrypoint.sh into a
+    # private tmpfs from the METRICS_SCRAPE_TOKEN variable.
+    authorization:
+      type: Bearer
+      credentials_file: /run/prometheus-credentials/metrics-token
 
   # --- Qdrant Vector Database ---
   - job_name: qdrant
@@ -50,17 +44,7 @@ scrape_configs:
     static_configs:
       - targets: ["qdrant:6333"]
         labels:
-          environment: production
-
-  # --- Ollama Local LLM ---
-  - job_name: ollama
-    metrics_path: /metrics
-    scheme: http
-    scrape_interval: 30s
-    static_configs:
-      - targets: ["ollama:11434"]
-        labels:
-          environment: production
+          environment: local
 
   # --- Prometheus Self-Monitoring ---
   - job_name: prometheus

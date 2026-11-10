@@ -1,60 +1,130 @@
 # =============================================================================
-# FraudAI Agent -- Production Docker Compose
+# FraudAI Agent -- local "production-like" Docker Compose (Mac/Linux, no GPU)
 #
-# Usage:
-#   docker compose -f docker-compose.prod.yml up -d
-#   docker compose -f docker-compose.prod.yml --profile build up sandbox
+# Start / stop / roll back with the scripts (they set the image variables):
+#   ./scripts/deploy.sh                 # builds fraudai-agent:<git sha>, starts the stack
+#   ./scripts/rollback.sh --previous    # or: rollback.sh <full sha>
 #
-# Reference: ADR-006
+# Design decisions (ADR-006, ADR-007, D2, D4):
+#   * Images of our own are referenced ONLY by immutable git-SHA tags, supplied by
+#     the scripts through FRAUDAI_IMAGE / FRONTEND_IMAGE. There is no ":latest".
+#   * Everything published is bound to 127.0.0.1 on configurable ports (defaults are
+#     free on the author's Mac; override in .env if yours are taken).
+#   * The LLM is the user's own authenticated Ollama daemon on the HOST, reached
+#     through host.docker.internal. No second, empty Ollama is started unless the
+#     optional "ollama-gpu" profile is requested.
+#   * The API container has NO docker.sock and SANDBOX_MODE=disabled: sandbox-backed
+#     tools (including the offensive ones) answer with an explicit sandbox_disabled
+#     error (ADR-007, D4-B). Never mount the Docker socket here.
+#   * Secrets live only in the local .env (never in tracked files or extra token files);
+#     the scripts hand .env to Compose with --env-file. Compose `secrets` are NOT used:
+#     they cannot be attached to the read_only API service. Required variables fail fast:
+#     `docker compose` aborts when they are unset.
 # =============================================================================
+
+name: fraudai-local
 
 services:
   # ---------------------------------------------------------------------------
   # FraudAI Agent API
   # ---------------------------------------------------------------------------
   fraudai:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: fraudai-agent:latest
-    container_name: fraudai-agent
+    image: ${FRAUDAI_IMAGE:?FRAUDAI_IMAGE is set by scripts/deploy.sh (fraudai-agent:<git sha>)}
     ports:
-      - "${FRAUDAI_PORT:-8000}:8000"
-    env_file: .env
+      - "127.0.0.1:${FRAUDAI_PORT:-8000}:8000"
+    # No env_file: only the names listed here reach the container, so the other secrets in
+    # the local .env (Grafana password, smoke-test credentials, the Prometheus-only
+    # settings) never enter the API. A bare name is passed through from .env (the scripts
+    # supply it with --env-file) and is simply absent when .env does not define it.
     environment:
-      # Override defaults for containerized networking
-      QDRANT_HOST: qdrant
-      QDRANT_PORT: 6333
-      QDRANT_GRPC_PORT: 6334
-      OLLAMA_HOST: http://ollama:11434
-      ENVIRONMENT: production
-      # ADR-007 / D4-B: this container has no docker.sock, so it cannot run
-      # sandboxes. Sandbox-backed tools (incl. offensive red-teaming ones) answer
-      # with an explicit "sandbox_disabled" error instead of a stub. Do NOT mount
-      # /var/run/docker.sock here; run the API on a Docker host to enable them.
-      SANDBOX_MODE: disabled
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - JWT_SECRET
+      - LLM_PROVIDER
+      - LLM_MODEL
+      - OLLAMA_MODEL
+      - OLLAMA_KEEP_ALIVE
+      - OPENAI_API_KEY
+      - GROQ_API_KEY
+      - ANTHROPIC_API_KEY
+      - AUTH_USERNAME
+      - AUTH_PASSWORD_HASH
+      - AUTH_TENANT_ID
+      - AUTH_TIER
+      - AUTH_IS_ADMIN
+      - LOGIN_MAX_FAILURES
+      - LOGIN_LOCKOUT_SECONDS
+      - RATE_LIMIT_REQUESTS_PER_MINUTE
+      - MAX_SESSIONS_PER_TENANT
+      - HISTORY_WINDOW_MESSAGES
+      - LLM_INPUT_COST_PER_MTOK_USD
+      - LLM_OUTPUT_COST_PER_MTOK_USD
+      - READINESS_INTERVAL_SECONDS
+      # The stable, metrics-only scrape credential (F5c: accepted on /admin/metrics only).
+      # Passed from .env as a variable because Compose `secrets` cannot be attached to a
+      # read_only service; Prometheus receives the same variable (see its entrypoint).
+      - METRICS_SCRAPE_TOKEN
+      - LOG_LEVEL
+      - LOG_FORMAT
+      # Container-to-container wiring
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_GRPC_PORT=6334
+      # D2: the host's Ollama daemon (already authenticated for cloud models).
+      - OLLAMA_HOST=${OLLAMA_HOST_FROM_CONTAINER:-http://host.docker.internal:11434}
+      # F5c contract: SQLite lives on the writable named volume below.
+      - DATABASE_PATH=/app/data/fraudai.db
+      # The browser origin of the frontend must be allowed by CORS.
+      - CORS_ALLOWED_ORIGINS=http://localhost:${FRONTEND_PORT:-3000},http://127.0.0.1:${FRONTEND_PORT:-3000}
+      # BUILD_SHA is baked into the image (Dockerfile) and deliberately NOT set here.
+      # ADR-007 / D4-B: no docker.sock in this container, so no sandbox. Do NOT mount
+      # /var/run/docker.sock here; run the API on a Docker host to enable sandboxes.
+      - SANDBOX_MODE=disabled
+    extra_hosts:
+      # Docker Desktop provides host.docker.internal; Linux engines need this mapping.
+      - "host.docker.internal:host-gateway"
     depends_on:
       qdrant:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
+    volumes:
+      # Named volumes keep the image's ownership (uid 1000), so the non-root user can
+      # write SQLite data and the Hugging Face cache on a read-only root filesystem.
+      - fraudai_data:/app/data
+      - hf_cache:/home/fraudai/.cache/huggingface
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      # Liveness only; readiness (/api/v1/readyz) is verified by scripts/deploy.sh.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/livez"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 120s
     deploy:
       resources:
         limits:
-          memory: 4g
+          memory: 6g
         reservations:
           memory: 1g
-    # Security: read-only filesystem where possible
     read_only: true
     tmpfs:
       - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Frontend (Next.js; image built by scripts/deploy.sh from frontend/Dockerfile)
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is set by scripts/deploy.sh (fraudai-frontend:<git sha>)}
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - fraudai
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
 
@@ -63,17 +133,18 @@ services:
   # ---------------------------------------------------------------------------
   qdrant:
     image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
-    container_name: fraudai-qdrant
     ports:
-      - "127.0.0.1:6333:6333"
-      - "127.0.0.1:6334:6334"
+      - "127.0.0.1:${QDRANT_HTTP_PORT:-6333}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_HOST_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
       QDRANT__SERVICE__GRPC_PORT: 6334
     mem_limit: 2g
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      # The qdrant image ships neither curl nor wget: probe /healthz over a plain TCP
+      # socket with bash (verified against the running image).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q 200"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -83,13 +154,16 @@ services:
       - no-new-privileges:true
 
   # ---------------------------------------------------------------------------
-  # Ollama Local LLM (Donna routing + simple queries)
+  # Optional second Ollama inside Docker (NVIDIA GPU hosts only).
+  # Off by default: `docker compose --profile ollama-gpu up`. It starts EMPTY (no
+  # models, no cloud login) and listens on its own loopback port so it never
+  # collides with the host daemon on 11434.
   # ---------------------------------------------------------------------------
   ollama:
+    profiles: ["ollama-gpu"]
     image: ollama/ollama:0.40.15@sha256:0e59999e0e8f9fd4e704bd788a89b7e4cad399367fb1365f8c102ac662288761
-    container_name: fraudai-ollama
     ports:
-      - "127.0.0.1:11434:11434"
+      - "127.0.0.1:${OLLAMA_CONTAINER_PORT:-11435}:11434"
     volumes:
       - ollama_data:/root/.ollama
     deploy:
@@ -110,22 +184,33 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Prometheus — Metrics Collection & Alerting
+  # Prometheus -- metrics collection and rule evaluation (no Alertmanager is deployed)
+  # No --web.enable-lifecycle: configuration reloads need a container restart.
   # ---------------------------------------------------------------------------
   prometheus:
     image: prom/prometheus:v2.53.0@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc
-    container_name: fraudai-prometheus
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
-      - ./monitoring/prometheus:/etc/prometheus:ro
+      # Single files/dirs, not the whole /etc/prometheus: a read-only bind of the parent
+      # cannot host the nested rules mount (the mountpoint cannot be created).
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/entrypoint.sh:/etc/prometheus/entrypoint.sh:ro
       - ./monitoring/alerts:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
+    # The same dedicated, non-expiring, metrics-only credential the API accepts on
+    # /api/v1/admin/metrics (F5c; a stable token, not a JWT), delivered from .env as the
+    # variable below. The static entrypoint writes it to the private tmpfs and unsets it
+    # before exec, so Prometheus' own environment does not contain it.
+    entrypoint: ["/bin/sh", "/etc/prometheus/entrypoint.sh"]
+    environment:
+      METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:?METRICS_SCRAPE_TOKEN must be set in .env (32+ random characters)}
+    tmpfs:
+      - /run/prometheus-credentials:mode=0700,uid=65534,gid=65534,size=64k,noexec,nosuid
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=30d"
-      - "--web.enable-lifecycle"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
@@ -143,19 +228,18 @@ services:
       - no-new-privileges:true
 
   # ---------------------------------------------------------------------------
-  # Grafana — Dashboards & Visualization
+  # Grafana -- dashboards (password is mandatory: no insecure default)
   # ---------------------------------------------------------------------------
   grafana:
     image: grafana/grafana:11.1.0@sha256:079600c9517b678c10cda6006b4487d3174512fd4c6cface37df7822756ed7a5
-    container_name: fraudai-grafana
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD must be set to a non-empty value in .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
@@ -178,28 +262,10 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # ---------------------------------------------------------------------------
-  # Sandbox Image (build-only -- not a running service)
-  # Builds the sandbox image used by SandboxEngine for code execution when the
-  # API runs on a Docker host (SANDBOX_MODE=docker). The containerised API above
-  # does not use it (SANDBOX_MODE=disabled, ADR-007).
-  # ---------------------------------------------------------------------------
-  sandbox:
-    build:
-      context: src/fraudai/tools/sandbox_image/
-      dockerfile: Dockerfile
-    image: fraudai-sandbox:latest
-    container_name: fraudai-sandbox-builder
-    profiles: ["build"]
-    # This container exits immediately -- it only exists to build the image.
-    entrypoint: ["echo", "Sandbox image built successfully"]
-
 volumes:
   qdrant_data:
-    driver: local
   ollama_data:
-    driver: local
   prometheus_data:
-    driver: local
   grafana_data:
-    driver: local
+  fraudai_data:
+  hf_cache:

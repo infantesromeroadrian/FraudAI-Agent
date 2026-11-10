@@ -12,14 +12,22 @@ Reference: SR-009 (tenant isolation), ADR-003 (LangGraph thread_id mapping).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from collections import Counter
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from fraudai.core.database import MAX_AGENT_HISTORY
+from fraudai.core.metrics import ACTIVE_SESSIONS
+
 if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+    from typing import Any
+
     from fraudai.core.database import Database
 
 logger = logging.getLogger(__name__)
@@ -40,29 +48,123 @@ class SessionData(BaseModel):
 
 
 _MAX_SESSIONS = 1000
+_MAX_SESSIONS_PER_TENANT = 200
 
 
 class SessionManager:
     """Manages chat sessions with metadata tracking.
 
-    Thread-safe for single-process async usage (no cross-process locking).
-    Evicts the oldest session when ``_MAX_SESSIONS`` is exceeded.
+    Single-process: no cross-process locking, and every limit below is per process.
 
-    When constructed with a ``Database`` instance, all mutations are
-    persisted to SQLite. If the database is ``None`` (or any DB call
-    fails), the manager falls back to the in-memory cache only.
+    Limits: ``max_sessions_per_tenant`` evicts that tenant's own oldest session; the global
+    ``max_sessions`` evicts the oldest session of the tenant holding the most, so one tenant
+    flooding the service cannot push out the others. ``max_agent_history`` keeps only the
+    newest history entries (``turn_count`` keeps the true total).
+
+    When constructed with a ``Database`` instance, all mutations are persisted to SQLite by
+    background tasks that this manager keeps referenced; ``aclose`` waits for them. If the
+    database is ``None`` (or a write fails), the in-memory cache keeps working.
     """
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(
+        self,
+        db: Database | None = None,
+        *,
+        max_sessions: int = _MAX_SESSIONS,
+        max_sessions_per_tenant: int = _MAX_SESSIONS_PER_TENANT,
+        max_agent_history: int = MAX_AGENT_HISTORY,
+    ) -> None:
         self._db = db
         self._sessions: dict[str, SessionData] = {}
+        self._max_sessions = max_sessions
+        self._max_per_tenant = max_sessions_per_tenant
+        self._max_history = max_agent_history
+        # Strong references: the event loop only keeps weak ones, so an unreferenced
+        # fire-and-forget task can be collected before it finishes.
+        self._tasks: set[asyncio.Task[None]] = set()
+        # The DB helpers read-modify-write one row; the lock keeps them in creation order
+        # so two quick writes to the same session cannot overwrite each other.
+        self._db_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Background persistence
+    # ------------------------------------------------------------------
+
+    def _persist(self, operation: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        """Run a DB write in a referenced background task (skipped without DB or loop)."""
+        if self._db is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # No event loop: nothing can run the write; memory stays authoritative.
+        task = loop.create_task(operation())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def pending_persist_count(self) -> int:
+        """Number of database writes still running in the background."""
+        return len(self._tasks)
+
+    async def aclose(self) -> None:
+        """Wait for every pending database write (call before closing the database)."""
+        while self._tasks:
+            pending = list(self._tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._tasks.difference_update(pending)
+
+    # ------------------------------------------------------------------
+    # Sessions
+    # ------------------------------------------------------------------
+
+    def _evict(self, session_id: str, reason: str, *, delete_stored: bool = True) -> None:
+        session = self._sessions.pop(session_id, None)
+        if session is None:
+            return
+        if delete_stored:
+            self._persist(lambda: self._db_delete_session(session_id))
+        logger.info(
+            "Session evicted (%s): session_id=%s, tenant_id=%s",
+            reason,
+            session_id,
+            session.tenant_id,
+        )
+
+    def _make_room_for(self, tenant_id: str) -> None:
+        """Apply the per-tenant quota, then the global cap, before adding a session."""
+        own = [sid for sid, s in self._sessions.items() if s.tenant_id == tenant_id]
+        if len(own) >= self._max_per_tenant:
+            self._evict(own[0], "tenant quota")
+        if len(self._sessions) >= self._max_sessions:
+            holders = Counter(s.tenant_id for s in self._sessions.values())
+            heaviest = max(holders, key=lambda tenant: holders[tenant])
+            victim = next(sid for sid, s in self._sessions.items() if s.tenant_id == heaviest)
+            self._evict(victim, "global cap")
+
+    def _enforce_limits_after_restore(self) -> None:
+        """Bring restored sessions within the current quotas and history bound.
+
+        Memory only: stored rows are left alone, so lowering a limit by mistake never
+        destroys data; the surplus is simply not loaded (oldest first, heaviest tenant
+        first for the global cap). ``turn_count`` keeps the true total.
+        """
+        for session in self._sessions.values():
+            del session.agent_history[: -self._max_history]
+        by_tenant: dict[str, list[str]] = {}
+        for sid, session in self._sessions.items():  # creation order: oldest first
+            by_tenant.setdefault(session.tenant_id, []).append(sid)
+        for owned in by_tenant.values():
+            for sid in owned[: max(0, len(owned) - self._max_per_tenant)]:
+                self._evict(sid, "restore: tenant quota", delete_stored=False)
+        while len(self._sessions) > self._max_sessions:
+            holders = Counter(s.tenant_id for s in self._sessions.values())
+            heaviest = max(holders, key=lambda tenant: holders[tenant])
+            victim = next(sid for sid, s in self._sessions.items() if s.tenant_id == heaviest)
+            self._evict(victim, "restore: global cap", delete_stored=False)
 
     def create_session(self, tenant_id: str, tier: str) -> str:
         """Create a new session and return its ID."""
-        if len(self._sessions) >= _MAX_SESSIONS:
-            oldest_key = next(iter(self._sessions))
-            del self._sessions[oldest_key]
-            logger.info("Session evicted (max %d reached): %s", _MAX_SESSIONS, oldest_key)
+        self._make_room_for(tenant_id)
 
         session_id = str(uuid.uuid4())
         self._sessions[session_id] = SessionData(
@@ -70,16 +172,8 @@ class SessionManager:
             tenant_id=tenant_id,
             tier=tier,
         )
-
-        # Persist to DB (fire-and-forget via task to keep sync signature)
-        if self._db is not None:
-            import asyncio
-
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._db_create_session(session_id, tenant_id, tier))
-            except RuntimeError:
-                pass  # No event loop -- skip DB persist
+        self._persist(lambda: self._db_create_session(session_id, tenant_id, tier))
+        ACTIVE_SESSIONS.set(len(self._sessions))
 
         logger.info(
             "Session created: session_id=%s, tenant_id=%s, tier=%s",
@@ -101,19 +195,14 @@ class SessionManager:
         tenant. Kept for restore/migration paths that already trust the ID.
         """
         if session_id not in self._sessions:
+            self._make_room_for(tenant_id)
             self._sessions[session_id] = SessionData(
                 session_id=session_id,
                 tenant_id=tenant_id,
                 tier=tier,
             )
-            if self._db is not None:
-                import asyncio
-
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(self._db_create_session(session_id, tenant_id, tier))
-                except RuntimeError:
-                    pass
+            self._persist(lambda: self._db_create_session(session_id, tenant_id, tier))
+            ACTIVE_SESSIONS.set(len(self._sessions))
             logger.info("Session registered via ensure_session: %s", session_id)
         return session_id
 
@@ -121,14 +210,8 @@ class SessionManager:
         """Delete a session. Returns True if it existed."""
         removed = self._sessions.pop(session_id, None)
         if removed:
-            if self._db is not None:
-                import asyncio
-
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(self._db_delete_session(session_id))
-                except RuntimeError:
-                    pass
+            self._persist(lambda: self._db_delete_session(session_id))
+            ACTIVE_SESSIONS.set(len(self._sessions))
             logger.info("Session deleted: session_id=%s", session_id)
             return True
         return False
@@ -140,16 +223,9 @@ class SessionManager:
             logger.warning("record_turn called for unknown session: %s", session_id)
             return
         session.agent_history.append(agent)
+        del session.agent_history[: -self._max_history]
         session.turn_count += 1
-
-        if self._db is not None:
-            import asyncio
-
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._db_record_turn(session_id, agent))
-            except RuntimeError:
-                pass
+        self._persist(lambda: self._db_record_turn(session_id, agent))
 
     def record_upload(self, session_id: str, filename: str) -> None:
         """Record a file upload in the session."""
@@ -158,15 +234,7 @@ class SessionManager:
             logger.warning("record_upload called for unknown session: %s", session_id)
             return
         session.uploaded_files.append(filename)
-
-        if self._db is not None:
-            import asyncio
-
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._db_record_upload(session_id, filename))
-            except RuntimeError:
-                pass
+        self._persist(lambda: self._db_record_upload(session_id, filename))
 
     def list_sessions(self, tenant_id: str | None = None) -> list[SessionData]:
         """List all sessions, optionally filtered by tenant."""
@@ -191,40 +259,47 @@ class SessionManager:
                 data = self._db._row_to_session_dict(row)
                 self._sessions[data["session_id"]] = SessionData(**data)
                 count += 1
-            logger.info("Loaded %d sessions from database", count)
-            return count
+            self._enforce_limits_after_restore()
+            kept = len(self._sessions)
+            ACTIVE_SESSIONS.set(kept)
+            logger.info("Loaded %d sessions from database (%d kept within limits)", count, kept)
+            return kept
         except Exception:
             logger.exception("Failed to load sessions from database, starting fresh")
             return 0
 
     # ------------------------------------------------------------------
-    # DB helpers (async, called via create_task)
+    # DB helpers (async, run as tracked background tasks)
     # ------------------------------------------------------------------
 
     async def _db_create_session(self, session_id: str, tenant_id: str, tier: str) -> None:
         try:
             assert self._db is not None  # noqa: S101
-            await self._db.create_session(session_id, tenant_id, tier)
+            async with self._db_lock:
+                await self._db.create_session(session_id, tenant_id, tier)
         except Exception:
             logger.exception("DB: failed to persist session %s", session_id)
 
     async def _db_delete_session(self, session_id: str) -> None:
         try:
             assert self._db is not None  # noqa: S101
-            await self._db.delete_session(session_id)
+            async with self._db_lock:
+                await self._db.delete_session(session_id)
         except Exception:
             logger.exception("DB: failed to delete session %s from DB", session_id)
 
     async def _db_record_turn(self, session_id: str, agent: str) -> None:
         try:
             assert self._db is not None  # noqa: S101
-            await self._db.record_turn(session_id, agent)
+            async with self._db_lock:
+                await self._db.record_turn(session_id, agent, max_history=self._max_history)
         except Exception:
             logger.exception("DB: failed to record turn for session %s", session_id)
 
     async def _db_record_upload(self, session_id: str, filename: str) -> None:
         try:
             assert self._db is not None  # noqa: S101
-            await self._db.record_upload(session_id, filename)
+            async with self._db_lock:
+                await self._db.record_upload(session_id, filename)
         except Exception:
             logger.exception("DB: failed to record upload for session %s", session_id)
