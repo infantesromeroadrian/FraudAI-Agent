@@ -6,13 +6,19 @@ import ConfirmationDialog from "../src/components/chat/ConfirmationDialog";
 import type { PendingAction } from "../src/lib/types";
 import { PENDING } from "./helpers";
 
-function render(over: Partial<PendingAction> = {}, isSubmitting = false, error: string | null = null): string {
+function render(
+  over: Partial<PendingAction> = {},
+  isSubmitting = false,
+  error: string | null = null,
+  decisionsBlocked = false,
+): string {
   return renderToStaticMarkup(
     <ConfirmationDialog
       pending={{ ...PENDING, ...over }}
       isSubmitting={isSubmitting}
       error={error}
       notice={null}
+      decisionsBlocked={decisionsBlocked}
       onDecision={() => undefined}
     />,
   );
@@ -50,6 +56,13 @@ describe("ConfirmationDialog (F5b.3)", () => {
     assert.ok(!/Cancel|Close/.test(idle), "no tacit dismissal");
     const busy = render({}, true);
     assert.equal((busy.match(/disabled=""/g) ?? []).length, 2);
+  });
+
+  it("does not invite a decision while the SSE turn is still open", () => {
+    const html = render({}, false, null, true);
+    assert.equal((html.match(/disabled=""/g) ?? []).length, 2);
+    assert.match(html, /Waiting for the response to finish/);
+    assert.ok(!/Waiting for the response/.test(render()));
   });
 
   it("shows an alert for conflicts / failures", () => {

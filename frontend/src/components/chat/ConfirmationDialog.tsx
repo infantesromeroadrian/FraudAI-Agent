@@ -18,6 +18,8 @@ interface ConfirmationDialogProps {
   isSubmitting: boolean;
   error: string | null;
   notice: string | null;
+  /** The SSE turn is still open: show the action but do not invite a decision yet. */
+  decisionsBlocked: boolean;
   onDecision: (approved: boolean) => void;
 }
 
@@ -26,6 +28,7 @@ export default function ConfirmationDialog({
   isSubmitting,
   error,
   notice,
+  decisionsBlocked,
   onDecision,
 }: ConfirmationDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -41,8 +44,8 @@ export default function ConfirmationDialog({
 
   // Land on the safe choice (Reject) for each action and after each request.
   useEffect(() => {
-    if (!isSubmitting) rejectRef.current?.focus();
-  }, [pending.action_id, isSubmitting]);
+    if (!isSubmitting && !decisionsBlocked) rejectRef.current?.focus();
+  }, [pending.action_id, isSubmitting, decisionsBlocked]);
 
   // Keep Tab inside the modal; Escape intentionally does nothing.
   function handleKeyDown(e: KeyboardEvent<HTMLDivElement>) {
@@ -179,6 +182,11 @@ export default function ConfirmationDialog({
           </code>
         </p>
 
+        {decisionsBlocked && (
+          <p className="mb-4 text-sm text-orange-200" role="status" aria-live="polite">
+            Waiting for the response to finish before you can decide…
+          </p>
+        )}
         <p className="sr-only" role="status" aria-live="polite">
           {isSubmitting ? "Submitting your decision…" : ""}
         </p>
@@ -189,7 +197,7 @@ export default function ConfirmationDialog({
             ref={rejectRef}
             type="button"
             onClick={() => onDecision(false)}
-            disabled={isSubmitting}
+            disabled={isSubmitting || decisionsBlocked}
             className="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-red-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400 focus-visible:ring-offset-2 focus-visible:ring-offset-gray-900 disabled:cursor-not-allowed disabled:opacity-50"
             aria-label={`Reject ${pending.tool}`}
           >
@@ -199,7 +207,7 @@ export default function ConfirmationDialog({
             ref={approveRef}
             type="button"
             onClick={() => onDecision(true)}
-            disabled={isSubmitting}
+            disabled={isSubmitting || decisionsBlocked}
             className="rounded-lg bg-green-700 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-green-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:ring-offset-2 focus-visible:ring-offset-gray-900 disabled:cursor-not-allowed disabled:opacity-50"
             aria-label={`Approve ${pending.tool}`}
           >

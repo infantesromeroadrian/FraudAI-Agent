@@ -114,7 +114,37 @@ describe("describeToolFailure (sandbox disabled/unavailable)", () => {
     assert.ok(text);
     assert.match(text, /sandbox_disabled/);
     assert.match(text, /disabled/i);
-    assert.match(text, /not executed|did not run|nothing/i);
+    assert.match(text, /not executed/i);
+  });
+  it("sandbox_unavailable is also an explicit non-execution", () => {
+    const text = describeToolFailure({
+      tool_name: "t",
+      status: "error",
+      result: { status: "error", error_code: "sandbox_unavailable", error: "Docker not available." },
+      duration_ms: 0,
+    });
+    assert.ok(text);
+    assert.match(text, /sandbox_unavailable/);
+    assert.match(text, /not executed/i);
+  });
+  it("generic errors never claim the action did not run", () => {
+    const generic = [
+      { status: "error", error_code: "sandbox_error", error: "could not confirm container stop" },
+      { status: "error", error: "boom" },
+    ];
+    for (const result of generic) {
+      const text = describeToolFailure({ tool_name: "t", status: "error", result, duration_ms: 5 });
+      assert.ok(text);
+      assert.ok(!/not executed|did not run|nothing ran/i.test(text), text);
+      assert.match(text, /failed/i);
+      assert.match(text, /unknown|cannot be ruled out|may/i);
+    }
+  });
+  it("status error with result null reports failure without asserting non-execution", () => {
+    const text = describeToolFailure({ tool_name: "t", status: "error", result: null, duration_ms: 0 });
+    assert.ok(text);
+    assert.ok(!/not executed|did not run/i.test(text), text);
+    assert.match(text, /failed/i);
   });
   it("returns null for successful results", () => {
     assert.equal(
