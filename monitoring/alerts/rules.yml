@@ -4,6 +4,12 @@
 # Thresholds derived from F2 Spec SLAs (docs/F2_spec.md)
 # Runbook references point to docs/F6_runbook.md
 #
+# EVERY expression below uses a metric that the application or the scrape itself
+# really produces (fraudai_* from src/fraudai/core/metrics.py, and `up`). Nothing here
+# depends on node_exporter, GPU exporters, an Alertmanager or invented metrics;
+# scripts/check-rules.sh enforces that. These alerts are evaluated by Prometheus
+# only: no Alertmanager is deployed, so nothing is notified.
+#
 # Naming: FraudAI<Component><Condition>
 # =============================================================================
 
@@ -158,8 +164,9 @@ groups:
             Immediate investigation required. Check application logs and dependent services.
           runbook: "docs/F6_runbook.md#26-la-aplicacion-no-arranca"
 
-      # --- Claude API Rate Limiting ---
-      - alert: ClaudeAPIRateLimited
+      # --- Our own API answering 429 (fraudai_requests_total counts responses of THIS API;
+      # it does not observe upstream LLM providers) ---
+      - alert: APIRateLimitResponses
         expr: >
           sum(rate(fraudai_requests_total{status_code="429"}[5m])) > 0
         for: 2m
@@ -167,10 +174,10 @@ groups:
           severity: warning
           component: claude_api
         annotations:
-          summary: "Claude API rate limiting detected"
+          summary: "The API is answering HTTP 429"
           description: >
-            Receiving 429 responses from Claude API.
-            Agents (Harvey, Louis, Jessica, Mike, Rachel) may be degraded.
+            Clients are being rate limited by this API (fraudai_requests_total, status_code=429).
+            This metric does not observe upstream LLM provider errors.
           runbook: "docs/F6_runbook.md#23-claude-api-rate-limited"
 
   # ---------------------------------------------------------------------------
@@ -217,76 +224,6 @@ groups:
             Tools (Harvey analysis, Mike red team, Rachel pipelines) severely impacted.
           runbook: "docs/F6_runbook.md#24-sandbox-container-no-se-limpia"
 
-      # --- Orphaned Sandbox Containers ---
-      - alert: SandboxContainersLeaking
-        expr: >
-          fraudai_sandbox_containers_active > 20
-        for: 15m
-        labels:
-          severity: warning
-          component: sandbox
-        annotations:
-          summary: "Too many active sandbox containers (> 20)"
-          description: >
-            {{ $value }} sandbox containers are active. Expected max ~10 under normal load.
-            Containers may not be cleaning up properly.
-          runbook: "docs/F6_runbook.md#24-sandbox-container-no-se-limpia"
-
-  # ---------------------------------------------------------------------------
-  # Cost Alerts
-  # ---------------------------------------------------------------------------
-  - name: fraudai_costs
-    rules:
-      # --- Daily Token Cost ---
-      # F2 SLA: Token cost per session < $0.40 (avg 10 turns)
-      # At 100 concurrent sessions, max daily ~$50 is a reasonable ceiling
-      - alert: TokenCostHigh
-        expr: >
-          increase(fraudai_token_cost_usd_total[24h]) > 50
-        for: 0m
-        labels:
-          severity: warning
-          component: cost
-        annotations:
-          summary: "Estimated daily token cost exceeds $50"
-          description: >
-            24h token spend is ${{ $value | printf "%.2f" }}.
-            Threshold based on 100 sessions x $0.40/session = $40 target + 25% buffer.
-            Review if sessions or per-turn costs are higher than expected.
-          runbook: "docs/F6_runbook.md#23-claude-api-rate-limited"
-
-      - alert: TokenCostCritical
-        expr: >
-          increase(fraudai_token_cost_usd_total[24h]) > 100
-        for: 0m
-        labels:
-          severity: critical
-          component: cost
-        annotations:
-          summary: "Daily token cost exceeds $100 — possible abuse or leak"
-          description: >
-            24h token spend is ${{ $value | printf "%.2f" }}.
-            This is 2x the expected ceiling. Investigate for prompt injection loops,
-            runaway agents, or unauthorized usage.
-          runbook: "docs/F6_runbook.md#23-claude-api-rate-limited"
-
-      # --- Per-Session Cost Anomaly ---
-      - alert: SessionCostAnomaly
-        expr: >
-          histogram_quantile(0.95,
-            sum(rate(fraudai_session_cost_usd_bucket[1h])) by (le)
-          ) > 1.0
-        for: 15m
-        labels:
-          severity: warning
-          component: cost
-        annotations:
-          summary: "P95 session cost exceeds $1.00 (2.5x SLA target)"
-          description: >
-            P95 per-session cost is ${{ $value | printf "%.2f" }}.
-            SLA target: < $0.40 average per 10-turn session.
-          runbook: "docs/F6_runbook.md#23-claude-api-rate-limited"
-
   # ---------------------------------------------------------------------------
   # Availability Alerts
   # ---------------------------------------------------------------------------
@@ -317,111 +254,6 @@ groups:
         annotations:
           summary: "Qdrant vector database is down"
           description: >
-            Qdrant is unreachable. RAG queries (Louis, Harvey RAG) will fail.
+            Prometheus cannot scrape Qdrant. RAG queries (Louis, Harvey RAG) will fail.
             App runs in degraded mode without Qdrant.
           runbook: "docs/F6_runbook.md#21-qdrant-no-arranca"
-
-      # --- Ollama Down ---
-      - alert: OllamaDown
-        expr: up{job="ollama"} == 0
-        for: 1m
-        labels:
-          severity: critical
-          component: ollama
-        annotations:
-          summary: "Ollama LLM service is down"
-          description: >
-            Ollama is unreachable. Donna (router) cannot classify intents.
-            All agent routing is blocked.
-          runbook: "docs/F6_runbook.md#22-ollama-oom-out-of-memory--vram"
-
-      # --- No Active Sessions (business hours) ---
-      # During 08:00-20:00 UTC, zero sessions for 1h may indicate a problem
-      - alert: NoActiveSessions
-        expr: >
-          fraudai_active_sessions == 0
-          and ON() hour() >= 8 < 20
-        for: 1h
-        labels:
-          severity: info
-          component: api
-        annotations:
-          summary: "No active sessions for 1h during business hours"
-          description: >
-            Zero active sessions during business hours (08:00-20:00 UTC).
-            May indicate an access issue, DNS problem, or upstream outage.
-          runbook: "docs/F6_runbook.md#26-la-aplicacion-no-arranca"
-
-  # ---------------------------------------------------------------------------
-  # Resource Alerts (from F6 Runbook section 5.3)
-  # ---------------------------------------------------------------------------
-  - name: fraudai_resources
-    rules:
-      # --- GPU VRAM Usage ---
-      # RTX 2000 Ada = 8 GB; Ollama + BGE-M3 ~7 GB peak
-      - alert: GPUVRAMHigh
-        expr: >
-          nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes > 0.9
-        for: 10m
-        labels:
-          severity: warning
-          component: gpu
-        annotations:
-          summary: "GPU VRAM usage exceeds 90%"
-          description: >
-            VRAM usage is {{ $value | humanizePercentage }}.
-            RTX 2000 Ada has 8 GB. Ollama may OOM if embedding or other GPU
-            processes start. Consider OLLAMA_KEEP_ALIVE=5m.
-          runbook: "docs/F6_runbook.md#22-ollama-oom-out-of-memory--vram"
-
-      # --- Host Memory ---
-      - alert: HostMemoryHigh
-        expr: >
-          (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.85
-        for: 10m
-        labels:
-          severity: warning
-          component: infrastructure
-        annotations:
-          summary: "Host memory usage exceeds 85%"
-          description: >
-            Available RAM is low. Consider scaling container memory limits
-            or investigating memory leaks.
-          runbook: "docs/F6_runbook.md#26-la-aplicacion-no-arranca"
-
-      # --- Qdrant Disk Usage ---
-      - alert: QdrantDiskHigh
-        expr: >
-          (1 - node_filesystem_avail_bytes{mountpoint=~".*qdrant.*"} / node_filesystem_size_bytes{mountpoint=~".*qdrant.*"}) > 0.8
-        for: 30m
-        labels:
-          severity: warning
-          component: qdrant
-        annotations:
-          summary: "Qdrant storage volume exceeds 80% capacity"
-          description: >
-            Qdrant disk usage is {{ $value | humanizePercentage }}.
-            Clean expired session collections or expand volume.
-          runbook: "docs/F6_runbook.md#21-qdrant-no-arranca"
-
-  # ---------------------------------------------------------------------------
-  # RAG Corpus Freshness
-  # ---------------------------------------------------------------------------
-  - name: fraudai_rag
-    rules:
-      # --- BOE Corpus Staleness ---
-      # F2 SLA: Corpus freshness < 10 days since BOE publication
-      - alert: BOECorpusStale
-        expr: >
-          (time() - fraudai_boe_last_ingestion_timestamp) > 864000
-        for: 1h
-        labels:
-          severity: warning
-          component: rag
-        annotations:
-          summary: "BOE corpus not updated in > 10 days"
-          description: >
-            Last ingestion was {{ $value | humanizeDuration }} ago.
-            SLA target: corpus freshness < 10 days (F2 spec section 2.1).
-            Louis may cite outdated legislation.
-          runbook: "docs/F6_runbook.md#25-boe-ingestion-falla"

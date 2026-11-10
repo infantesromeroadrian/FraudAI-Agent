@@ -33,11 +33,12 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
 
 # 1) Third-party deps only (cached layer; depends solely on the lock files)
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project --no-editable
+# extra openai: the OpenAI-compatible provider (ChatOpenAI) is the D2 route to Ollama
+RUN uv sync --frozen --no-dev --no-install-project --no-editable --extra openai
 
 # 2) The project itself, installed into the venv (NOT editable: no link to /app/src)
 COPY src/ ./src/
-RUN uv sync --frozen --no-dev --no-editable && \
+RUN uv sync --frozen --no-dev --no-editable --extra openai && \
     rm -rf /root/.cache
 
 # ---------------------------------------------------------------------------
@@ -60,15 +61,36 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
-# Non-root user for security
-RUN useradd -m -s /bin/bash -u 1000 fraudai
+# Non-root user for security. /app/data (SQLite) and the Hugging Face cache are created
+# here, owned by that user, so named volumes mounted on them are writable by the
+# effective user even though the root filesystem is read-only in Compose.
+RUN useradd -m -s /bin/bash -u 1000 fraudai && \
+    mkdir -p /app/data /home/fraudai/.cache/huggingface && \
+    chown -R fraudai:fraudai /app/data /home/fraudai/.cache
+ENV HF_HOME=/home/fraudai/.cache/huggingface
+
+# Build identity, baked into the image (scripts/deploy.sh passes the real commit SHA
+# resolved from git; there is no default so a build without it is visibly unlabelled).
+# The image label is the source of truth; BUILD_SHA (the name F5c's API reads) carries
+# the same value, so /api/v1/readyz can report the revision the container really runs.
+# Compose must never override BUILD_SHA: scripts/deploy.sh compares the served value
+# with the image label and refuses a mismatch.
+ARG GIT_SHA=unset
+ARG BUILD_DATE=unset
+LABEL org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.title="fraudai-agent"
+ENV BUILD_SHA="${GIT_SHA}"
 USER fraudai
 
 EXPOSE 8000
 
-# Healthcheck against the FastAPI /api/v1/health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -f http://localhost:8000/api/v1/health || exit 1
+# Liveness only (/livez calls no dependency): the container is restarted when the process
+# is dead, never because Qdrant or the LLM are down. Readiness is /api/v1/readyz,
+# checked by the deploy/rollback scripts. start-period covers loading the embedding
+# model on a cold Hugging Face cache.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD curl -fsS http://localhost:8000/api/v1/livez >/dev/null || exit 1
 
 # Production server: uvicorn with app factory
 # Workers controlled via FRAUDAI_WORKERS env var (default 1 in CMD, override in compose)

@@ -31,7 +31,8 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - run: uv sync --frozen --extra dev
+      # openai extra: the provider tests need langchain_openai (the Docker image has it too)
+      - run: uv sync --frozen --extra dev --extra openai
       - run: uv run ruff check src/ tests/
       - run: uv run ruff format --check src/ tests/
 
@@ -56,7 +57,8 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - run: uv sync --frozen --extra dev
+      # openai extra: the provider tests need langchain_openai (the Docker image has it too)
+      - run: uv sync --frozen --extra dev --extra openai
       - run: uv run python -m pytest tests/ -q --ignore=tests/test_smoke_live.py --cov=fraudai --cov-report=xml --cov-fail-under=80
       - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         if: always()
@@ -80,7 +82,7 @@ jobs:
                  UV_PROJECT_ENVIRONMENT=/opt/venv-test
           python -V
           python -c "import sys; assert sys.version_info[:3] == (3, 11, 18), sys.version"
-          uv sync --extra dev
+          uv sync --extra dev --extra openai
           uv run python -m pytest tests/ -q --ignore=tests/test_smoke_live.py -m "not docker" --cov=fraudai --cov-report=term --cov-fail-under=80
           SCRIPT
       - name: pytest in python:3.11.18 container (frozen lock)
@@ -166,7 +168,8 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - run: uv sync --frozen --extra dev
+      # openai extra: the provider tests need langchain_openai (the Docker image has it too)
+      - run: uv sync --frozen --extra dev --extra openai
       - run: docker build -t "$FRAUDAI_SANDBOX_IMAGE" src/fraudai/tools/sandbox_image/
       # Evidence is taken before AND after the battery (the "after" step also runs
       # when the battery fails), so a run shows which daemon and image it exercised
@@ -186,6 +189,21 @@ jobs:
           echo "sandbox-labelled containers:"; docker ps -a --filter label=fraudai.sandbox=1 --format '{{.Names}}'
           echo "sandbox-labelled networks:"; docker network ls --filter label=fraudai.sandbox=1 --format '{{.Name}}'
 
+  # F5a: operations tooling. Simulated-command logic tests (no real deployment here),
+  # shellcheck, promtool + "no unknown metric", and the Compose file's required variables.
+  ops:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: shellcheck -x scripts/*.sh
+      - run: python3 -m unittest discover -s scripts/tests -v
+      - run: ./scripts/check-rules.sh
+      - name: "Compose file renders with synthetic values (quiet - the config is never printed)"
+        run: |
+          printf 'GRAFANA_PASSWORD=synthetic\nMETRICS_SCRAPE_TOKEN=synthetic-not-a-secret\n' > "$RUNNER_TEMP/synthetic.env"
+          FRAUDAI_IMAGE=fraudai-agent:ci FRONTEND_IMAGE=fraudai-frontend:ci \
+          docker compose -f docker-compose.prod.yml --env-file "$RUNNER_TEMP/synthetic.env" config -q
+
   frontend:
     runs-on: ubuntu-latest
     steps:
@@ -202,4 +220,6 @@ jobs:
       - run: cd frontend && pnpm install --frozen-lockfile
       - run: cd frontend && pnpm lint
       - run: cd frontend && pnpm type-check
+      # F5b adds the `test` script (node:test over tsc); this step needs that change merged
+      - run: cd frontend && pnpm test
       - run: cd frontend && pnpm build
