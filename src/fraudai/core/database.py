@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,14 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/fraudai.db")
+# Newest entries kept per session; the true total lives in ``turn_count``.
+MAX_AGENT_HISTORY = 200
+# How long the write probe waits for another writer before declaring the file unusable.
+_WRITE_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+class DatabaseUnavailableError(RuntimeError):
+    """The SQLite file cannot be created or written; never swallowed in production."""
 
 
 class Database:
@@ -30,7 +39,51 @@ class Database:
         self._db: aiosqlite.Connection | None = None
 
     async def initialize(self) -> None:
-        """Create database file (if missing) and ensure tables exist."""
+        """Create database file (if missing), ensure tables exist and prove it is writable.
+
+        Raises:
+            DatabaseUnavailableError: the directory, the file or its tables cannot be
+                created, or the file is read-only. The caller decides whether to degrade.
+        """
+        try:
+            await self._open_and_migrate()
+            await self.check_writable()
+        except DatabaseUnavailableError:
+            await self.close()
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            await self.close()
+            msg = f"Database at {self._db_path} is not usable: {type(exc).__name__}"
+            raise DatabaseUnavailableError(msg) from exc
+        logger.info("Database initialized at %s", self._db_path)
+
+    async def check_writable(self) -> None:
+        """Prove a write transaction can start (separate connection: never disturbs requests).
+
+        Raises:
+            RuntimeError: not initialised.
+            DatabaseUnavailableError: the file cannot be written.
+        """
+        self._ensure_connected()
+        if self._db_path == ":memory:":
+            return
+        try:
+            async with aiosqlite.connect(
+                self._db_path, timeout=_WRITE_PROBE_TIMEOUT_SECONDS
+            ) as probe:
+                # BEGIN IMMEDIATE alone succeeds on a read-only file; a real (rolled back)
+                # write is what proves the file accepts changes.
+                cursor = await probe.execute("PRAGMA user_version")
+                row = await cursor.fetchone()
+                version = int(row[0]) if row is not None else 0
+                await probe.execute("BEGIN IMMEDIATE")
+                await probe.execute(f"PRAGMA user_version = {version}")
+                await probe.rollback()
+        except (OSError, sqlite3.Error) as exc:
+            msg = f"Database at {self._db_path} is not writable: {type(exc).__name__}"
+            raise DatabaseUnavailableError(msg) from exc
+
+    async def _open_and_migrate(self) -> None:
         db_dir = Path(self._db_path).parent
         db_dir.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +114,6 @@ class Database:
             """
         )
         await self._db.commit()
-        logger.info("Database initialized at %s", self._db_path)
 
     def _ensure_connected(self) -> aiosqlite.Connection:
         """Return the active connection or raise."""
@@ -113,8 +165,10 @@ class Database:
         await db.commit()
         return cursor.rowcount > 0
 
-    async def record_turn(self, session_id: str, agent: str) -> None:
-        """Append an agent name to the session history and bump turn_count."""
+    async def record_turn(
+        self, session_id: str, agent: str, *, max_history: int = MAX_AGENT_HISTORY
+    ) -> None:
+        """Append an agent to the history (newest ``max_history`` kept) and bump turn_count."""
         db = self._ensure_connected()
         cursor = await db.execute(
             "SELECT agent_history, turn_count FROM sessions WHERE session_id = ?",
@@ -127,6 +181,7 @@ class Database:
 
         history: list[str] = json.loads(row[0])
         history.append(agent)
+        del history[:-max_history]
         new_count = row[1] + 1
 
         await db.execute(

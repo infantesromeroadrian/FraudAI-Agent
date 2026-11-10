@@ -46,6 +46,9 @@ def _mock_settings(**overrides: Any) -> MagicMock:
         "llm_provider": "groq",
         "anthropic_api_key": "",
         "groq_api_key": "",
+        # Local login is not configured unless a test sets it (see test_f5c_login.py).
+        "auth_username": "",
+        "auth_password_hash": "",
     }
     defaults.update(overrides)
     return MagicMock(**defaults)
@@ -377,25 +380,29 @@ class TestLoginEndpoint:
         assert payload["tenant_id"] == "default"
         assert payload["tier"] == "enterprise"
 
-    async def test_login_returns_501_in_staging(self, client: httpx.AsyncClient) -> None:
+    async def test_unconfigured_login_in_staging_issues_no_token(
+        self, client: httpx.AsyncClient
+    ) -> None:
         """Staging has no free login: any credentials must not mint a token."""
         with patch("fraudai.api.routes.settings", _mock_settings(environment="staging")):
             resp = await client.post(
                 "/api/v1/auth/token",
                 data={"username": "anyone", "password": "anything"},
             )
-        assert resp.status_code == 501
+        assert resp.status_code == 503
         assert "access_token" not in resp.json()
 
-    async def test_login_returns_501_in_production(self, client: httpx.AsyncClient) -> None:
-        """Login in production returns 501 (not yet implemented)."""
+    async def test_unconfigured_login_in_production_is_503_not_501(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """Without a configured user, production says so (503); 501 no longer exists."""
         with patch("fraudai.api.routes.settings", _mock_settings(environment="production")):
             resp = await client.post(
                 "/api/v1/auth/token",
                 data={"username": "user", "password": "pass"},
             )
-        assert resp.status_code == 501
-        assert "Production authentication not configured" in resp.json()["detail"]
+        assert resp.status_code == 503
+        assert resp.json() == {"detail": "Login is not configured on this server."}
 
     async def test_login_token_works_for_auth(
         self, app: FastAPI, client: httpx.AsyncClient

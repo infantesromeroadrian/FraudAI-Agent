@@ -85,10 +85,14 @@ async def _get_donna_router() -> DonnaRouter:
     global _donna_router  # noqa: PLW0603
     async with _init_lock:
         if _donna_router is None:
+            # With Ollama selected, Donna must not receive the Groq key: it would send the
+            # user's ambiguous messages to a provider nobody chose. Other providers keep
+            # the previous behaviour.
+            groq_key = None if settings.llm_provider == "ollama" else settings.groq_api_key
             _donna_router = DonnaRouter(
                 ollama_host=settings.ollama_host,
                 model=settings.ollama_model,
-                groq_api_key=settings.groq_api_key or None,
+                groq_api_key=groq_key or None,
             )
     return _donna_router
 
@@ -113,16 +117,19 @@ async def _get_claude_invoker() -> ClaudeAgentInvoker:
     async with _init_lock:
         if _claude_invoker is None:
             provider = settings.llm_provider
-            if provider == "groq":
-                api_key = settings.groq_api_key
-            elif provider == "anthropic":
-                api_key = settings.anthropic_api_key
-            else:
-                api_key = settings.anthropic_api_key
+            # Each provider gets only its own credential. Ollama is the personal daemon at
+            # OLLAMA_HOST: no key at all (the client sends a non-secret literal there).
+            api_keys = {
+                "groq": settings.groq_api_key,
+                "anthropic": settings.anthropic_api_key,
+                "openai": settings.openai_api_key,
+                "ollama": "",
+            }
             _claude_invoker = ClaudeAgentInvoker(
-                api_key=api_key,
+                api_key=api_keys[provider],
                 model=settings.llm_model,
                 provider=provider,
+                base_url=settings.ollama_host if provider == "ollama" else None,
             )
     return _claude_invoker
 
