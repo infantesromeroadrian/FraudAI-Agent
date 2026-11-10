@@ -8,9 +8,10 @@ interface HeaderProps {
   sessionId: string | null;
   currentAgent: AgentName | null;
   selectedAgent: AgentName | null;
+  onLogout: () => void;
 }
 
-export function Header({ sessionId, currentAgent, selectedAgent }: HeaderProps) {
+export function Header({ sessionId, currentAgent, selectedAgent, onLogout }: HeaderProps) {
   const displayAgent = selectedAgent ?? currentAgent;
   const agentInfo = displayAgent ? AGENTS[displayAgent] : null;
 
@@ -37,6 +38,13 @@ export function Header({ sessionId, currentAgent, selectedAgent }: HeaderProps) 
             Session: {sessionId.slice(0, 8)}
           </span>
         )}
+        <button
+          type="button"
+          onClick={onLogout}
+          className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
+        >
+          Sign out
+        </button>
       </div>
     </header>
   );

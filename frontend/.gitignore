@@ -1,0 +1,4 @@
+node_modules
+.next
+.test-build
+tsconfig.tsbuildinfo
