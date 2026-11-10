@@ -151,6 +151,41 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+  # ADR-007 / F3.5: the sandbox controls are proven against a real Docker daemon.
+  # FRAUDAI_DOCKER_TESTS=1 makes a missing daemon or image a hard failure
+  # instead of a silent skip. The image is built locally, never pushed.
+  docker-integration:
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, test]
+    env:
+      FRAUDAI_DOCKER_TESTS: "1"
+      FRAUDAI_SANDBOX_IMAGE: fraudai-sandbox:ci-integration
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --extra dev
+      - run: docker build -t "$FRAUDAI_SANDBOX_IMAGE" src/fraudai/tools/sandbox_image/
+      # Evidence is taken before AND after the battery (the "after" step also runs
+      # when the battery fails), so a run shows which daemon and image it exercised
+      # and whether anything labelled as sandbox-owned was left behind. Read-only.
+      - name: Record Docker and image (before)
+        run: |
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}} os={{.Server.Os}}/{{.Server.Arch}}'
+          docker image inspect "$FRAUDAI_SANDBOX_IMAGE" --format 'image={{.Id}} created={{.Created}} arch={{.Architecture}}'
+          echo "sandbox-labelled containers:"; docker ps -a --filter label=fraudai.sandbox=1 --format '{{.Names}}'
+          echo "sandbox-labelled networks:"; docker network ls --filter label=fraudai.sandbox=1 --format '{{.Name}}'
+      - run: uv run pytest tests/integration -m docker -v
+      - name: Record Docker and image (after)
+        if: always()
+        run: |
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}} os={{.Server.Os}}/{{.Server.Arch}}'
+          docker image inspect "$FRAUDAI_SANDBOX_IMAGE" --format 'image={{.Id}} created={{.Created}} arch={{.Architecture}}'
+          echo "sandbox-labelled containers:"; docker ps -a --filter label=fraudai.sandbox=1 --format '{{.Names}}'
+          echo "sandbox-labelled networks:"; docker network ls --filter label=fraudai.sandbox=1 --format '{{.Name}}'
+
   frontend:
     runs-on: ubuntu-latest
     steps:

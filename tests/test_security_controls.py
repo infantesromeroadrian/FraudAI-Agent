@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import socket
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,10 +14,21 @@ from pydantic import ValidationError
 from fraudai.core import session_context
 from fraudai.core.config import Settings
 from fraudai.core.session_context import active_session_id, bind_session
-from fraudai.tools.implementations import ToolImplementations
+from fraudai.tools.egress import (
+    EgressDeniedError,
+    EgressPolicy,
+    EgressTarget,
+    alias_for,
+    is_public_address,
+)
+from fraudai.tools.implementations import SandboxDisabled, ToolImplementations
+from fraudai.tools.sandbox import SandboxResult
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
+
+    from fraudai.tools.egress import IPAddress
 
 
 @pytest.fixture()
@@ -432,3 +443,176 @@ def test_non_development_accepts_a_long_random_jwt_secret(environment: str) -> N
 
 def test_development_keeps_the_default_secret_for_local_use() -> None:
     assert Settings(_env_file=None, environment="development").jwt_secret
+
+
+# ---------------------------------------------------------------------------
+# ADR-007: validated target is pinned; nothing but that address may be dialled
+# ---------------------------------------------------------------------------
+
+
+def _policy(
+    *addresses: str, allowed: Callable[[IPAddress], bool] = is_public_address
+) -> EgressPolicy:
+    return EgressPolicy(resolver=lambda _host: list(addresses), address_allowed=allowed)
+
+
+def test_validate_pins_one_resolved_address_and_keeps_hostname_as_alias_only() -> None:
+    target = _policy("2606:4700::1", "93.184.216.34").validate("https://Model.Example:8443/p")
+
+    assert target == EgressTarget(
+        scheme="https", hostname="model.example", address="93.184.216.34", port=8443
+    )
+
+
+def test_default_ports_follow_the_scheme() -> None:
+    assert _policy("93.184.216.34").validate("http://m.example/x").port == 80
+    assert _policy("93.184.216.34").validate("https://m.example/x").port == 443
+
+
+def test_resolver_is_consulted_once_per_validation() -> None:
+    calls: list[str] = []
+
+    def resolver(host: str) -> list[str]:
+        calls.append(host)
+        return ["93.184.216.34"]
+
+    EgressPolicy(resolver=resolver).validate("https://m.example/")
+
+    assert calls == ["m.example"]  # no second lookup that rebinding could poison
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "169.254.169.254",  # IMDS
+        "169.254.1.1",  # link-local
+        "172.17.0.1",  # default Docker gateway
+        "172.19.0.1",  # user-defined Docker bridge gateway
+        "192.168.1.1",
+        "100.100.100.200",  # CGNAT metadata service
+        "::ffff:10.0.0.1",
+        "fe80::1",
+        "64:ff9b::a00:1",  # NAT64 embedding 10.0.0.1
+        "2002:a00:1::1",  # 6to4 embedding 10.0.0.1
+        "224.0.0.1",
+    ],
+)
+def test_any_non_public_resolved_address_blocks_the_target(address: str) -> None:
+    with pytest.raises(EgressDeniedError):
+        _policy("93.184.216.34", address).validate("https://m.example/")
+
+
+def test_invalid_port_and_garbage_addresses_are_blocked() -> None:
+    with pytest.raises(EgressDeniedError):
+        _policy("93.184.216.34").validate("https://m.example:99999/")
+    with pytest.raises(EgressDeniedError):
+        _policy("not-an-ip").validate("https://m.example/")
+
+
+def test_policy_can_be_injected_for_a_synthetic_target_without_relaxing_the_default() -> None:
+    synthetic = _policy("172.17.0.9", allowed=lambda ip: str(ip) == "172.17.0.9")
+
+    assert synthetic.validate("http://target.test:8080/").address == "172.17.0.9"
+    with pytest.raises(EgressDeniedError):
+        _policy("172.17.0.9").validate("http://target.test:8080/")  # default policy still blocks
+
+
+def test_dns_alias_rejects_ip_literals_and_odd_names() -> None:
+    literal = EgressTarget(
+        scheme="http", hostname="93.184.216.34", address="93.184.216.34", port=80
+    )
+    odd = EgressTarget(scheme="http", hostname="bad_name.example", address="93.184.216.34", port=80)
+
+    with pytest.raises(EgressDeniedError):
+        alias_for(literal)
+    with pytest.raises(EgressDeniedError):
+        alias_for(odd)
+    assert (
+        alias_for(EgressTarget(scheme="http", hostname="ok.example", address="1.1.1.1", port=80))
+        == "ok.example"
+    )
+
+
+async def test_validated_target_is_handed_to_the_sandbox(
+    impls: ToolImplementations,
+    networked_sandbox: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ToolImplementations, "_resolve_host", staticmethod(lambda _host: ["93.184.216.34"])
+    )
+    networked_sandbox.execute_python.return_value = SandboxResult(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        output_files={"result.json": b"{}"},
+        duration_seconds=0.1,
+    )
+
+    await impls.prompt_injection_suite(target_endpoint="https://model.example:8443/p")
+
+    egress = networked_sandbox.execute_python.call_args.kwargs["egress"]
+    assert (egress.hostname, egress.address, egress.port) == (
+        "model.example",
+        "93.184.216.34",
+        8443,
+    )
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: ToolImplementations._build_adversarial_evasion_code(
+            "https://m.example/p", "sign_noise"
+        ),
+        lambda: ToolImplementations._build_prompt_injection_code("https://m.example/p", None),
+    ],
+)
+def test_generated_http_client_refuses_redirects_and_environment_proxies(
+    build: Callable[[], str],
+) -> None:
+    code = build()
+
+    assert "urlopen(" not in code  # urllib's default opener follows 3xx
+    assert "HTTPRedirectHandler" in code
+    assert "return None" in code  # redirect_request refuses every hop
+    assert "ProxyHandler({})" in code
+
+
+# ---------------------------------------------------------------------------
+# D4 mode B: explicit error, never a stub, when the sandbox is off
+# ---------------------------------------------------------------------------
+
+_DISABLED = SandboxDisabled(code="sandbox_disabled", reason="turned off in this deployment")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda t: t.adversarial_evasion(target_endpoint="https://model.example/p"),
+        lambda t: t.prompt_injection_suite(target_endpoint="https://model.example/p"),
+        lambda t: t.analyze_transactions(data_path="x.csv"),
+        lambda t: t.detect_patterns(data_path="x.csv", algorithms=["isolation_forest"]),
+        lambda t: t.risk_scoring(data_path="x.csv"),
+        lambda t: t.graph_analysis(data_path="x.csv"),
+        lambda t: t.data_quality_check(data_path="x.csv"),
+    ],
+)
+async def test_disabled_sandbox_returns_an_explicit_error_for_every_sandbox_tool(
+    call: Callable[[ToolImplementations], Awaitable[dict[str, Any]]],
+) -> None:
+    tools = ToolImplementations(sandbox=None, disabled=_DISABLED)
+
+    result = await call(tools)
+
+    assert result["status"] == "disabled"
+    assert result["error_code"] == "sandbox_disabled"
+    assert "turned off" in result["error"]
+
+
+async def test_disabled_sandbox_does_not_block_tools_that_need_no_sandbox() -> None:
+    tools = ToolImplementations(sandbox=None, disabled=_DISABLED)
+
+    result = await tools.compliance_checklist(regulation="PSD2")
+
+    assert result.get("status") != "disabled"

@@ -115,6 +115,9 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+    "docker: needs a real Docker daemon and the sandbox image; mandatory when FRAUDAI_DOCKER_TESTS=1",
+]
 
 # Linux (CI / Docker) installs CPU-only torch: the default PyPI Linux wheel
 # drags ~3 GB of nvidia-*/triton CUDA packages (10 GB image) that no code path

@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
+
+    from fraudai.core.config import Settings
+    from fraudai.tools.implementations import ToolImplementations
+    from fraudai.tools.sandbox import SandboxEngine
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +31,81 @@ from fraudai.api.session_manager import SessionManager
 from fraudai.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class _UnavailableRetriever:
+    """Stand-in used when RAG failed to initialise: ``search_boe`` errors explicitly."""
+
+    async def retrieve(self, *_: Any, **__: Any) -> list[Any]:
+        msg = "search_boe is unavailable: the RAG components failed to initialise"
+        raise RuntimeError(msg)
+
+    def format_citations(self, *_: Any, **__: Any) -> list[dict[str, Any]]:
+        return []
+
+
+class SandboxStartupError(RuntimeError):
+    """The sandbox is required (SANDBOX_MODE=docker) but Docker or the image is unusable."""
+
+
+async def init_sandbox_tools(
+    cfg: Settings,
+    engine_factory: Callable[[], SandboxEngine] | None = None,
+) -> tuple[SandboxEngine | None, ToolImplementations]:
+    """Build the tool implementations for the configured sandbox mode (fail closed).
+
+    - ``disabled``: Docker is never touched; sandbox-backed tools answer with an
+      explicit ``sandbox_disabled`` error.
+    - ``docker`` and healthy: real implementations.
+    - ``docker`` but Docker/image unusable: staging and production refuse to
+      start; development starts with explicit ``sandbox_unavailable`` errors.
+      A failed sandbox never degrades to stub data.
+    """
+    from docker.errors import DockerException
+
+    from fraudai.tools.implementations import SandboxDisabled, ToolImplementations
+    from fraudai.tools.sandbox import SandboxEngine
+
+    if cfg.sandbox_mode == "disabled":
+        logger.warning("Sandbox disabled by configuration (SANDBOX_MODE=disabled)")
+        return None, ToolImplementations(
+            sandbox=None,
+            disabled=SandboxDisabled(
+                code="sandbox_disabled",
+                reason=(
+                    "Sandbox-backed tools (including offensive red-teaming tools) are "
+                    "disabled in this deployment (SANDBOX_MODE=disabled)."
+                ),
+            ),
+        )
+
+    def default_factory() -> SandboxEngine:
+        return SandboxEngine(
+            image=cfg.sandbox_image,
+            timeout=cfg.sandbox_timeout_seconds,
+            mem_limit=cfg.sandbox_mem_limit,
+            cpu_count=cfg.sandbox_cpu_count,
+            pids_limit=cfg.sandbox_pids_limit,
+            max_concurrent=cfg.sandbox_max_concurrent,
+        )
+
+    failure = "Docker is not reachable or the sandbox image is missing"
+    try:
+        engine = (engine_factory or default_factory)()
+        if await engine.health_check():
+            logger.info("SandboxEngine healthy -- real tool implementations enabled")
+            return engine, ToolImplementations(sandbox=engine)
+    except (DockerException, OSError):
+        logger.exception("Sandbox initialization failed")
+
+    if cfg.environment != "development":
+        msg = f"{failure} (image={cfg.sandbox_image}); refusing to start in {cfg.environment}"
+        raise SandboxStartupError(msg)
+    logger.error("%s -- sandbox-backed tools will return explicit errors", failure)
+    return None, ToolImplementations(
+        sandbox=None,
+        disabled=SandboxDisabled(code="sandbox_unavailable", reason=f"{failure}."),
+    )
 
 
 @asynccontextmanager
@@ -56,55 +135,44 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     except Exception:
         logger.exception("QdrantStore initialization failed -- continuing in degraded mode")
 
+    # Sandbox first and outside the degraded-mode try/except below: a required
+    # sandbox that is unusable must stop startup instead of being swallowed.
+    sandbox, tool_impls = await init_sandbox_tools(settings)
+
     # RAG retriever + tool registry (Bug #4 fix: wire ToolRegistry into runtime)
     from fraudai.agents.tool_registry import ToolRegistry
     from fraudai.ingestion.embeddings import EmbeddingGenerator
     from fraudai.rag.retriever import LegalRetriever
-    from fraudai.tools.implementations import ToolImplementations
-    from fraudai.tools.sandbox import SandboxEngine
 
+    embedder: EmbeddingGenerator | None = None
+    retriever: LegalRetriever | None = None
     try:
         embedder = EmbeddingGenerator(
             device="cpu"
         )  # CPU for API queries; GPU reserved for ingestion
         retriever = LegalRetriever(store=store, embedder=embedder)
-
-        # Attempt to initialise the sandbox for real tool implementations.
-        # If Docker is unavailable or the sandbox image is missing, gracefully
-        # degrade to stubs — never crash the startup.
-        sandbox: SandboxEngine | None = None
-        tool_impls: ToolImplementations | None = None
-        try:
-            sandbox = SandboxEngine()
-            sandbox_healthy = await sandbox.health_check()
-            if sandbox_healthy:
-                tool_impls = ToolImplementations(sandbox=sandbox)
-                logger.info("SandboxEngine healthy — real tool implementations enabled")
-            else:
-                logger.warning("Sandbox not healthy — tools will use stubs")
-        except Exception:
-            logger.exception("Sandbox initialization failed — tools will use stubs")
-
-        tool_registry = ToolRegistry(
-            retriever=retriever,
-            sandbox=sandbox,
-            tool_impls=tool_impls,
-        )
-        logger.info(
-            "ToolRegistry initialized (retriever=LegalRetriever, sandbox=%s, tool_impls=%s)",
-            "enabled" if sandbox is not None else "disabled",
-            "enabled" if tool_impls is not None else "stubs",
-        )
     except Exception:
-        logger.exception("ToolRegistry initialization failed — tools will use stubs")
-        tool_registry = None
-        retriever = None
+        logger.exception("RAG initialization failed -- search_boe will report it explicitly")
+        embedder = None
+
+    # The registry is built even when RAG is down: dropping it would send the graph
+    # back to AGENT_TOOLS stubs and lose the explicit sandbox provider (F3.6).
+    tool_registry = ToolRegistry(
+        retriever=retriever or cast("LegalRetriever", _UnavailableRetriever()),
+        sandbox=sandbox,
+        tool_impls=tool_impls,
+    )
+    logger.info(
+        "ToolRegistry initialized (retriever=%s, sandbox=%s, tool_impls=%s)",
+        "LegalRetriever" if retriever is not None else "unavailable",
+        "enabled" if sandbox is not None else "disabled",
+        "enabled" if sandbox is not None else "explicit-errors",
+    )
 
     # Inject ToolRegistry into graph BEFORE compilation
-    if tool_registry is not None:
-        from fraudai.agents.graph import set_tool_registry
+    from fraudai.agents.graph import set_tool_registry
 
-        set_tool_registry(tool_registry)
+    set_tool_registry(tool_registry)
 
     # LangGraph compiled graph
     graph = build_fraud_ai_graph()
@@ -149,7 +217,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.feedback_store = feedback_store
     app.state.tool_registry = tool_registry
     app.state.retriever = retriever
-    app.state.embedder = embedder if retriever is not None else None
+    app.state.embedder = embedder
     app.state.db = db
 
     yield
