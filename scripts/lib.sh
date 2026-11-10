@@ -11,7 +11,8 @@ FRONTEND_REPO="fraudai-frontend"
 REVISION_LABEL="org.opencontainers.image.revision"
 STATE_DIR="${FRAUDAI_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/fraudai-agent}"
 STATE_LOG="${STATE_DIR}/deployments.log"
-FRAUDAI_PORT="${FRAUDAI_PORT:-8000}"
+COMPOSE_PROJECT="fraudai-local"  # must equal `name:` in docker-compose.prod.yml (tested)
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[+]${NC} $*"; }
@@ -28,19 +29,67 @@ image_revision() {
 
 image_id() { docker image inspect --format '{{.Id}}' "$1" 2>/dev/null || true; }
 
+# Non-secret setting with the SAME precedence Compose applies to ${NAME:-default}:
+# a non-empty process variable, else the --env-file value, else the default. The dotenv is
+# parsed by dotenv_get.py, never sourced or evaluated by a shell.
+setting() {
+    local name="$1" default="$2" value=""
+    if [[ -n "${!name:-}" ]]; then
+        printf '%s' "${!name}"
+        return 0
+    fi
+    if [[ -f "$ENV_FILE" ]]; then
+        value="$(python3 "${LIB_DIR}/dotenv_get.py" "$ENV_FILE" "$name" 2>/dev/null || true)"
+    fi
+    printf '%s' "${value:-$default}"
+}
+
+# Ports published on 127.0.0.1 (and used for probes, the compiled API URL and the summary).
+resolve_port() {
+    local name="$1" default="$2" value
+    value="$(setting "$name" "$default")"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > 65535 )); then
+        die "${name} must be a port number between 1 and 65535 (got a different value)."
+    fi
+    printf '%s' "$value"
+}
+FRAUDAI_PORT="$(resolve_port FRAUDAI_PORT 8000)"
+# shellcheck disable=SC2034  # used by the scripts that source this file
+FRONTEND_PORT="$(resolve_port FRONTEND_PORT 3000)"
+# shellcheck disable=SC2034
+GRAFANA_PORT="$(resolve_port GRAFANA_PORT 3001)"
+# shellcheck disable=SC2034
+PROMETHEUS_PORT="$(resolve_port PROMETHEUS_PORT 9090)"
+
 # Compose wrapper: always the same file, env file for interpolation and image variables.
 compose() {
     docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
 }
 
-# SHA of the image the running API container was created from ("" when not running).
+# ID of the running API container, found by Compose's own labels. This deliberately does
+# NOT go through `docker compose`: Compose must interpolate the required FRAUDAI_IMAGE /
+# FRONTEND_IMAGE first, which a plain shell does not provide, and that failure would look
+# exactly like "nothing is running". Prints the id ("" when no container is running);
+# returns 2 when Docker itself cannot be queried, which callers must treat as an error.
+running_container_id() {
+    local out
+    if ! out="$(docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
+        --filter "label=com.docker.compose.service=fraudai" --format '{{.ID}}' 2>&1)"; then
+        log_error "cannot query Docker for the running API container: ${out}"
+        return 2
+    fi
+    printf '%s\n' "$out" | head -n 1
+}
+
+# SHA of the image the running API container was created from ("" when not running);
+# returns 2 when the query itself failed.
 running_sha() {
-    local cid
-    cid="$(compose ps -q fraudai 2>/dev/null | head -n 1)"
+    local cid img
+    cid="$(running_container_id)" || return 2
     [[ -n "$cid" ]] || return 0
-    local img
     img="$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)"
     [[ -n "$img" ]] && image_revision "$img"
+    return 0
 }
 
 # JSON field of GET /api/v1/readyz (first argument = field name). The body is parsed even
@@ -68,7 +117,7 @@ wait_for_ready() {
 #   3. the build_sha the API itself serves on /readyz equals the SHA.
 verify_running_sha() {
     local sha="$1" cid want_id have_id label served
-    cid="$(compose ps -q fraudai | head -n 1)"
+    cid="$(running_container_id)" || return 1
     [[ -n "$cid" ]] || { log_error "fraudai container is not running."; return 1; }
     want_id="$(image_id "${API_REPO}:${sha}")"
     have_id="$(docker inspect --format '{{.Image}}' "$cid")"

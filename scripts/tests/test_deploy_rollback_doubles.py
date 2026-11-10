@@ -27,7 +27,9 @@ SHA_B = "b" * 40
 
 
 class Harness:
-    def __init__(self, images: dict | None = None, running: str | None = None) -> None:
+    def __init__(
+        self, images: dict | None = None, running: str | None = None, dotenv: str = ""
+    ) -> None:
         self.dir = tempfile.TemporaryDirectory()
         root = Path(self.dir.name)
         self.state = root / "state.json"
@@ -42,12 +44,27 @@ class Harness:
             json.dumps({"images": images or {}, "running": running, "fail_up": False})
         )
         self.env_file = root / "synthetic.env"
-        self.env_file.write_text("GRAFANA_PASSWORD=synthetic\n")
+        self.env_file.write_text("GRAFANA_PASSWORD=synthetic\n" + dotenv)
         self.state_dir = root / "deploy-state"
 
     def run(self, script: str, *args: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
+        # a developer shell must not leak values the scripts resolve themselves
+        clean = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in {
+                "FRAUDAI_IMAGE",
+                "FRONTEND_IMAGE",
+                "FRAUDAI_PORT",
+                "FRONTEND_PORT",
+                "GRAFANA_PORT",
+                "PROMETHEUS_PORT",
+                "FRONTEND_BUILD_ARGS",
+            }
+        }
         env = {
-            **os.environ,
+            **clean,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "STUB_STATE": str(self.state),
             "STUB_LOG": str(self.log),
@@ -204,7 +221,10 @@ class DeployAndRollback(unittest.TestCase):
         self.assertIn("not found locally", result.stderr)
 
     def test_previous_without_history_is_refused(self) -> None:
-        h = self.harness()
+        h = self.harness(
+            images={f"fraudai-agent:{SHA_B}": image(SHA_B, "good00000000")},
+            running=f"fraudai-agent:{SHA_B}",
+        )
         result = h.run("rollback.sh", "--previous")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No previous deployment", result.stderr)
@@ -232,6 +252,117 @@ class DeployAndRollback(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn(SHA_A, result.stdout)
         self.assertNotIn("latest", result.stdout)
+
+
+class RunningVersionLookup(unittest.TestCase):
+    """Defect 1: the running version must not depend on Compose interpolation."""
+
+    def harness(self, **kw: object) -> Harness:
+        h = Harness(**kw)  # type: ignore[arg-type]
+        self.addCleanup(h.dir.cleanup)
+        return h
+
+    def test_previous_from_a_plain_shell_goes_back_to_a_not_to_b(self) -> None:
+        h = self.harness()
+        h.run("deploy.sh", "--ref", "HEAD~1", "--no-frontend")
+        h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        self.assertEqual(h.current()["running"], f"fraudai-agent:{SHA_B}")
+        # run() never provides FRAUDAI_IMAGE / FRONTEND_IMAGE: a plain shell
+        result = h.run("rollback.sh", "--previous")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(h.current()["running"], f"fraudai-agent:{SHA_A}")
+        self.assertIn(f"Rolling back: {SHA_B} -> {SHA_A}", result.stdout)
+
+    def test_a_failing_docker_query_is_an_error_not_an_absent_container(self) -> None:
+        h = self.harness()
+        h.run("deploy.sh", "--ref", "HEAD~1", "--no-frontend")
+        h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        before = h.current()["running"]
+        result = h.run("rollback.sh", "--previous", STUB_PS_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot query Docker", result.stderr)
+        self.assertEqual(h.current()["running"], before, "nothing may change on a failed query")
+
+    def test_deploy_also_refuses_when_the_running_version_cannot_be_determined(self) -> None:
+        h = self.harness()
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend", STUB_PS_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot query Docker", result.stderr)
+
+    def test_previous_with_nothing_running_requires_an_explicit_sha(self) -> None:
+        h = self.harness(
+            images={
+                f"fraudai-agent:{SHA_A}": image(SHA_A, "old000000000"),
+                f"fraudai-agent:{SHA_B}": image(SHA_B, "good00000000"),
+            }
+        )
+        h.state_dir.mkdir(parents=True)
+        (h.state_dir / "deployments.log").write_text(
+            f"t\tdeploy\t{SHA_A}\t-\tx\nt\tdeploy\t{SHA_B}\t{SHA_A}\tx\n"
+        )
+        result = h.run("rollback.sh", "--previous")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("explicit SHA", result.stderr)
+
+
+class PortResolution(unittest.TestCase):
+    """Defect 2: non-secret settings resolve like Compose (process > .env > default)."""
+
+    def harness(self, dotenv: str) -> Harness:
+        h = Harness(dotenv=dotenv)
+        self.addCleanup(h.dir.cleanup)
+        return h
+
+    @staticmethod
+    def urls(h: Harness, tool: str) -> list[str]:
+        return [c[-2] for c in h.calls() if c[0] == tool and "http" in str(c[-2])]
+
+    def test_port_defined_only_in_dotenv_drives_probes_and_compiled_url(self) -> None:
+        h = self.harness("FRAUDAI_PORT=18080\nFRONTEND_PORT='13000'\n")
+        result = h.run("deploy.sh", "--ref", "HEAD")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        probes = [c for c in h.calls() if c[0] == "curl"]
+        self.assertTrue(probes)
+        self.assertTrue(all(":18080/" in c[-2] for c in probes), probes)
+        builds = [
+            c
+            for c in h.calls()
+            if c[0] == "docker"
+            and c[1] == "build"
+            and "NEXT_PUBLIC_API_URL=http://localhost:18080/api/v1" in c
+        ]
+        self.assertEqual(len(builds), 1, "the browser bundle must point at the published API port")
+        compose_calls = [
+            c for c in h.calls() if c[0] == "docker" and c[1] == "compose" and "up" in c
+        ]
+        self.assertTrue(all("--env-file" in c and str(h.env_file) in c for c in compose_calls))
+        self.assertIn("http://127.0.0.1:13000", result.stdout)
+
+    def test_process_variable_wins_over_dotenv_like_compose(self) -> None:
+        h = self.harness("FRAUDAI_PORT=18080\n")
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend", FRAUDAI_PORT="19090")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        probes = [c for c in h.calls() if c[0] == "curl"]
+        self.assertTrue(all(":19090/" in c[-2] for c in probes), probes)
+
+    def test_default_applies_when_neither_defines_it(self) -> None:
+        h = self.harness("FRAUDAI_PORT=\n")  # empty counts as unset, like ${VAR:-8000}
+        h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        probes = [c for c in h.calls() if c[0] == "curl"]
+        self.assertTrue(all(":8000/" in c[-2] for c in probes), probes)
+
+    def test_dotenv_is_parsed_never_executed(self) -> None:
+        marker = Path(tempfile.gettempdir()) / f"f5a-exec-marker-{os.getpid()}"
+        h = self.harness(f"FRAUDAI_PORT=18080\nTRAP=$(touch {marker})\n`touch {marker}`\n")
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), "the dotenv file must not be evaluated by a shell")
+
+    def test_invalid_port_is_refused(self) -> None:
+        h = self.harness("FRAUDAI_PORT=80;rm\n")
+        result = h.run("deploy.sh", "--ref", "HEAD", "--no-frontend")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FRAUDAI_PORT", result.stderr)
 
 
 if __name__ == "__main__":

@@ -96,7 +96,7 @@ build_sandbox() {
         docker build --label "${REVISION_LABEL}=${SHA}" -t "fraudai-sandbox:${SHA}" -f Dockerfile -
 }
 
-PREVIOUS_SHA="$(running_sha || true)"
+PREVIOUS_SHA="$(running_sha)" || die "Cannot determine the version that is running now; refusing to deploy blind."
 
 build_once "$API_IMAGE" "FraudAI API image" build_api
 if [[ "$WITH_FRONTEND" == "true" ]]; then
@@ -139,8 +139,8 @@ echo "  Deployed commit : ${SHA}"
 echo "  Image           : ${API_IMAGE} ($(image_id "$API_IMAGE" | cut -c8-19))"
 echo "  Previous        : ${PREVIOUS_SHA:-none}"
 echo "  API             : http://127.0.0.1:${FRAUDAI_PORT}/api/v1/readyz"
-echo "  Frontend        : http://127.0.0.1:${FRONTEND_PORT:-3000}"
-echo "  Grafana         : http://127.0.0.1:${GRAFANA_PORT:-3001}"
-echo "  Prometheus      : http://127.0.0.1:${PROMETHEUS_PORT:-9090}"
+echo "  Frontend        : http://127.0.0.1:${FRONTEND_PORT}"
+echo "  Grafana         : http://127.0.0.1:${GRAFANA_PORT}"
+echo "  Prometheus      : http://127.0.0.1:${PROMETHEUS_PORT}"
 echo "  Rollback        : ./scripts/rollback.sh --previous   (or <full sha>)"
 echo "============================================"

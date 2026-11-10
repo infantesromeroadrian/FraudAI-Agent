@@ -67,6 +67,13 @@ def docker(args: list[str]) -> int:
                 continue
             cleaned.append(item)
         verb = cleaned[0]
+        if verb in {"ps", "up"}:
+            # docker-compose.prod.yml declares FRAUDAI_IMAGE / FRONTEND_IMAGE as required
+            # (${VAR:?...}); real Compose fails to interpolate when either is missing.
+            for required in ("FRAUDAI_IMAGE", "FRONTEND_IMAGE"):
+                if not os.environ.get(required):
+                    sys.stderr.write(f"required variable {required} is missing a value\n")
+                    return 15
         if verb == "ps":
             return print("cid-fraudai") or 0 if state.get("running") else 0
         if verb == "up":
@@ -79,6 +86,13 @@ def docker(args: list[str]) -> int:
             return 0
         if verb in {"exec", "logs"}:
             return 0
+        return 0
+    if args[0] == "ps":
+        if os.environ.get("STUB_PS_FAIL"):
+            sys.stderr.write("Cannot connect to the Docker daemon (simulated)\n")
+            return 1
+        if state.get("running"):
+            print("cid-fraudai")
         return 0
     if args[:2] == ["image", "inspect"]:
         fmt = args[args.index("--format") + 1] if "--format" in args else ""

@@ -42,9 +42,10 @@ fi
 
 [[ -n "$TARGET" ]] || die "Missing target: pass a commit SHA, --previous or --list."
 
-CURRENT_SHA="$(running_sha || true)"
+CURRENT_SHA="$(running_sha)" || die "Cannot determine the version that is running now; refusing to guess."
 if [[ "$TARGET" == "--previous" ]]; then
-    TARGET="$(previous_recorded_sha "${CURRENT_SHA:-none}")"
+    [[ -n "$CURRENT_SHA" ]] || die "Nothing is running, so there is no \"previous\" to go back from: pass an explicit SHA (see --list)."
+    TARGET="$(previous_recorded_sha "$CURRENT_SHA")"
     [[ -n "$TARGET" ]] || die "No previous deployment recorded in ${STATE_LOG}."
 fi
 

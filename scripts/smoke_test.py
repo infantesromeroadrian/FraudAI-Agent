@@ -31,6 +31,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from dotenv_util import read_dotenv
+
 API = "/api/v1"
 DEFAULT_ENV_FILE = Path(
     os.environ.get("FRAUDAI_ENV_FILE") or Path(__file__).resolve().parent.parent / ".env"
@@ -41,28 +43,6 @@ SYNTHETIC_CSV = (
     "t-002,9800.00,synthetic-exchange,ES\n"
     "t-003,15.00,synthetic-cafe,ES\n"
 )
-
-
-def read_dotenv(path: Path, wanted: set[str]) -> dict[str, str]:
-    """Values of the ``wanted`` keys in a dotenv file; nothing is evaluated or expanded."""
-    values: dict[str, str] = {}
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return values
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.removeprefix("export ").strip()
-        if key not in wanted:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key] = value
-    return values
 
 
 def resolve_credentials(env_file: Path) -> tuple[str, str]:
@@ -79,6 +59,31 @@ def resolve_credentials(env_file: Path) -> tuple[str, str]:
         os.environ.get("FRAUDAI_SMOKE_PASSWORD") or from_file.get("FRAUDAI_SMOKE_PASSWORD") or ""
     )
     return username, password
+
+
+AUTHORISED_AGENT = "mike"
+AUTHORISED_TOOL = "adversarial_evasion"
+AUTHORISED_ATTACK_TYPE = "sign_noise"
+
+
+def scope_deviations(pending: dict[str, object], url: str) -> list[str]:
+    """Names of the fields in which a proposed action differs from the exact request made.
+
+    The proposal is produced by the model, so nothing in it is trusted: the agent, the tool,
+    the displayed target and the EFFECTIVE arguments must all equal what this smoke test asked
+    for (the synthetic local service only, with the one perturbation requested). Extra or
+    missing arguments count as deviations. Values are not echoed: they come from the model.
+    """
+    expected_args = {"target_endpoint": url, "attack_type": AUTHORISED_ATTACK_TYPE}
+    checks = {
+        "kind": pending.get("kind") == "offensive_tool_approval",
+        "agent": pending.get("agent") == AUTHORISED_AGENT,
+        "tool": pending.get("tool") == AUTHORISED_TOOL,
+        "target": pending.get("target") == url,
+        "arguments": pending.get("arguments") == expected_args,
+        "action_id": bool(pending.get("action_id")),
+    }
+    return [name for name, same in checks.items() if not same]
 
 
 class SyntheticTarget:
@@ -313,10 +318,21 @@ class Smoke:
             )
         session_id, pending = proposal
         action_id = str(pending.get("action_id") or "")
+        deviations = scope_deviations(pending, url)
+        if deviations:
+            # Nothing positive is ever sent for a proposal outside the authorised scope: the
+            # pending action is closed with an explicit rejection instead.
+            if action_id:
+                self.confirm(session_id, action_id, False)
+            return self.record(
+                "HITL: the proposal is exactly the authorised request",
+                "FAIL",
+                f"approval withheld, proposal rejected; deviating fields: {', '.join(deviations)}",
+            )
         ok = self.record(
-            "HITL: offensive tool is proposed, not run",
-            "PASS" if pending.get("kind") == "offensive_tool_approval" and action_id else "FAIL",
-            f"tool={pending.get('tool')} target={pending.get('target')}",
+            "HITL: the proposal is exactly the authorised request",
+            "PASS",
+            f"tool={AUTHORISED_TOOL} target=<the synthetic local service> arguments=as requested",
         )
 
         # nothing may be approved implicitly: a new message while paused is refused
@@ -347,6 +363,16 @@ class Smoke:
 
         # the single real decision: approve exactly what was shown
         status, body = self.confirm(session_id, action_id, True)
+        follow_up = body.get("pending_action")
+        if isinstance(follow_up, dict):
+            # one authorised call: a further proposal is out of scope and is never approved
+            if follow_up.get("action_id"):
+                self.confirm(session_id, str(follow_up["action_id"]), False)
+            ok &= self.record(
+                "HITL: no further action is proposed",
+                "FAIL",
+                "the approval produced another pending action; it was rejected, not approved",
+            )
         results = body.get("tool_results") if isinstance(body.get("tool_results"), list) else []
         first = results[0] if results and isinstance(results[0], dict) else {}
         inner = first.get("result") if isinstance(first.get("result"), dict) else {}

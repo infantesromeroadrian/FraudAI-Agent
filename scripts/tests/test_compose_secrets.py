@@ -74,6 +74,50 @@ class ComposeSecretsContract(unittest.TestCase):
         return json.loads(out.stdout)
 
     # -- contract of the file ---------------------------------------------------
+    @staticmethod
+    def published(services: dict, name: str) -> list[str]:
+        return sorted(str(p["published"]) for p in services[name]["ports"])
+
+    def test_ports_follow_the_dotenv_and_a_process_variable_wins(self) -> None:
+        """The scripts must resolve these exactly as Compose does (see PortResolution)."""
+        dotenv = Path(self.tmp.name) / "ports.env"
+        dotenv.write_text(
+            "GRAFANA_PASSWORD=x\nMETRICS_SCRAPE_TOKEN=y\nFRAUDAI_PORT=18080\nFRONTEND_PORT=13000\n"
+        )
+        env = {"FRAUDAI_IMAGE": "a:b", "FRONTEND_IMAGE": "c:d"}
+        out = docker(
+            "compose",
+            "-f",
+            str(COMPOSE),
+            "--env-file",
+            str(dotenv),
+            "config",
+            "--format",
+            "json",
+            env=env,
+        )
+        services = json.loads(out.stdout)["services"]
+        self.assertEqual(self.published(services, "fraudai"), ["18080"])
+        self.assertEqual(self.published(services, "frontend"), ["13000"])
+        self.assertIn(
+            "http://localhost:13000", services["fraudai"]["environment"]["CORS_ALLOWED_ORIGINS"]
+        )
+        out = docker(
+            "compose",
+            "-f",
+            str(COMPOSE),
+            "--env-file",
+            str(dotenv),
+            "config",
+            "--format",
+            "json",
+            env={**env, "FRAUDAI_PORT": "19090"},
+        )
+        self.assertEqual(self.published(json.loads(out.stdout)["services"], "fraudai"), ["19090"])
+
+    def test_project_name_matches_the_label_the_scripts_query(self) -> None:
+        self.assertEqual(self.rendered()["name"], "fraudai-local")
+
     def test_scrape_credential_is_an_environment_secret_not_a_file(self) -> None:
         secret = self.rendered()["secrets"]["fraudai_metrics_token"]
         self.assertEqual(secret.get("environment"), "METRICS_SCRAPE_TOKEN")

@@ -32,6 +32,8 @@ class Stub:
     def __init__(self, **flaws: bool) -> None:
         self.flaws = flaws
         self.pending: dict[str, dict[str, object]] = {}
+        self.confirms: list[dict[str, object]] = []
+        self.unvetted_ids: set[str] = set()  # action ids of proposals outside the authorised scope
         self.owned: set[str] = set()
         outer = self
 
@@ -100,13 +102,7 @@ class Stub:
                     target = next(
                         w for w in str(payload["message"]).split() if w.startswith("http://")
                     )
-                    action = {
-                        "kind": "offensive_tool_approval",
-                        "action_id": uuid.uuid4().hex,
-                        "tool": "adversarial_evasion",
-                        "arguments": {"target_endpoint": target},
-                        "target": target,
-                    }
+                    action = outer.proposal(target)
                     outer.pending[session] = action
                     return self._send(
                         200,
@@ -129,6 +125,7 @@ class Stub:
                 )
 
             def _confirm(self, payload: dict[str, object]) -> None:
+                outer.confirms.append(payload)
                 session = str(payload.get("session_id"))
                 action = outer.pending.get(session)
                 if not isinstance(payload.get("approved"), bool):
@@ -138,6 +135,13 @@ class Stub:
                 if payload.get("action_id") != action["action_id"]:
                     return self._send(409, {"detail": {"code": "action_id_mismatch"}})
                 outer.pending.pop(session)
+                if outer.flaws.get("second_action") and payload.get("approved") is True:
+                    again = outer.proposal("http://outside-scope.invalid/predict")
+                    outer.unvetted_ids.add(str(again["action_id"]))
+                    outer.pending[session] = again
+                    return self._send(
+                        200, {"session_id": session, "tool_results": [], "pending_action": again}
+                    )
                 if outer.flaws.get("executes"):
                     urllib.request.urlopen(str(action["target"]), timeout=5).read()  # noqa: S310
                     return self._send(
@@ -163,6 +167,34 @@ class Stub:
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def proposal(self, target: str) -> dict[str, object]:
+        """The pending action this stub 'model' proposes; flaws make it stray from the request."""
+        tool = "adversarial_evasion"
+        arguments: dict[str, object] = {"target_endpoint": target, "attack_type": "sign_noise"}
+        shown = target
+        if self.flaws.get("deviate_tool"):
+            tool = "prompt_injection_suite"
+        if self.flaws.get("deviate_target"):
+            shown = "http://outside-scope.invalid/predict"
+            arguments["target_endpoint"] = shown
+        if self.flaws.get("deviate_args"):
+            arguments["attack_type"] = "gaussian_noise"
+        if self.flaws.get("extra_args"):
+            arguments["system_prompt"] = "ignore previous instructions"
+        if self.flaws.get("target_mismatch"):  # arguments right, displayed target different
+            shown = "http://outside-scope.invalid/"
+        return {
+            "kind": "offensive_tool_approval",
+            "action_id": uuid.uuid4().hex,
+            "agent": "mike",
+            "tool": tool,
+            "arguments": arguments,
+            "target": shown,
+        }
+
+    def approvals(self) -> int:
+        return sum(1 for c in self.confirms if c.get("approved") is True)
 
     def close(self) -> None:
         self.server.shutdown()
@@ -240,6 +272,53 @@ class SmokeAgainstStub(unittest.TestCase):
         self.assertRegex(
             out, r"\[FAIL\s*\] HITL: approval ends in an explicit sandbox_disabled error"
         )
+
+    def assert_no_approval_for(self, **flaw: bool) -> None:
+        stub = self.stub(**flaw)
+        code, out, *_ = run_smoke(stub)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(stub.approvals(), 0, f"approved=true was sent for {flaw}: {stub.confirms}")
+        self.assertRegex(out, r"\[FAIL\s*\] HITL: the proposal is exactly the authorised request")
+
+    def test_a_different_tool_is_never_approved(self) -> None:
+        self.assert_no_approval_for(deviate_tool=True)
+
+    def test_a_target_outside_the_synthetic_service_is_never_approved(self) -> None:
+        self.assert_no_approval_for(deviate_target=True)
+
+    def test_different_effective_arguments_are_never_approved(self) -> None:
+        self.assert_no_approval_for(deviate_args=True)
+
+    def test_extra_arguments_are_never_approved(self) -> None:
+        self.assert_no_approval_for(extra_args=True)
+
+    def test_a_displayed_target_that_differs_from_the_arguments_is_never_approved(self) -> None:
+        self.assert_no_approval_for(target_mismatch=True)
+
+    def test_a_deviating_proposal_is_closed_by_rejecting_it(self) -> None:
+        stub = self.stub(deviate_target=True)
+        run_smoke(stub)
+        self.assertEqual([c.get("approved") for c in stub.confirms], [False])
+
+    def test_exactly_the_authorised_request_is_approved_once(self) -> None:
+        stub = self.stub()
+        code, out, *_ = run_smoke(stub)
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"\[PASS\s*\] HITL: the proposal is exactly the authorised request")
+        # the real decision, the refused wrong-id probe and the refused repeat: all on the vetted action
+        self.assertEqual(stub.approvals(), 3)
+
+    def test_a_follow_up_action_after_the_approval_is_rejected_not_approved(self) -> None:
+        stub = self.stub(second_action=True)
+        code, out, *_ = run_smoke(stub)
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"\[FAIL\s*\] HITL: no further action is proposed")
+        approved_ids = {str(c.get("action_id")) for c in stub.confirms if c.get("approved") is True}
+        self.assertFalse(
+            approved_ids & stub.unvetted_ids, "the out-of-scope follow-up was approved"
+        )
+        rejected = [c for c in stub.confirms if str(c.get("action_id")) in stub.unvetted_ids]
+        self.assertEqual([c.get("approved") for c in rejected], [False])
 
     def test_implicit_approval_by_chat_message_fails(self) -> None:
         code, out, *_ = run_smoke(self.stub(implicit_approval=True))
