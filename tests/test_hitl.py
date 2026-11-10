@@ -889,3 +889,87 @@ async def test_stream_with_only_a_read_only_tool_keeps_mike_as_the_agent_and_for
     assert second.json()["agent"] == "mike"
     assert second.json()["message"] == probe.mike_text
     assert probe.mike_plan_calls == 2  # the model really ran again
+
+
+# ---------------------------------------------------------------------------
+# A tool that reports "disabled/unavailable" did not run: it must read as a failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def disabled_registry(probe: _Probe, monkeypatch: pytest.MonkeyPatch, request: Any) -> Any:
+    """Real ToolRegistry + ToolImplementations with the sandbox switched off (no Docker)."""
+    from unittest.mock import MagicMock
+
+    from fraudai.agents.tool_registry import ToolRegistry
+    from fraudai.tools.implementations import SandboxDisabled, ToolImplementations
+
+    code = request.param
+    impls = ToolImplementations(
+        sandbox=None, disabled=SandboxDisabled(code=code, reason=f"synthetic reason for {code}")
+    )
+    registry = ToolRegistry(retriever=MagicMock(), tool_impls=impls)
+    monkeypatch.setattr(graph_module, "_tool_registry", registry)
+    return code
+
+
+async def _failed_statuses(graph: Any, config: Any) -> set[str]:
+    """Statuses any proposal went through (finalize clears them from the live state)."""
+    seen: set[str] = set()
+    async for snap in graph.aget_state_history(config):
+        seen.update(p["status"] for p in snap.values.get("proposed_actions") or [])
+    return seen
+
+
+@pytest.mark.parametrize(
+    "disabled_registry", ["sandbox_disabled", "sandbox_unavailable"], indirect=True
+)
+async def test_disabled_sandbox_result_is_a_failure_not_a_success(
+    probe: _Probe, disabled_registry: str
+) -> None:
+    code = disabled_registry
+    graph, config, action = await _paused_graph(probe)
+
+    final = await graph.ainvoke(_answer(action["action_id"], True), config)
+
+    (result,) = final["tool_results"]
+    assert result["status"] == "error"
+    assert result["error_code"] == code
+    assert result["tool_output"] is None
+    assert "failed" in await _failed_statuses(graph, config)
+    assert "executed" not in await _failed_statuses(graph, config)
+    (messages,) = probe.final_messages
+    (tool_message,) = [m for m in messages if isinstance(m, ToolMessage)]
+    assert 'status="error"' in tool_message.content
+    assert code in tool_message.content
+    assert 'status="success"' not in tool_message.content
+    assert tool_message.content.count("</tool_output>") == 1
+    assert probe.executions == []  # the spy registry was replaced: nothing offensive ran
+
+
+@pytest.mark.parametrize(
+    "disabled_registry", ["sandbox_disabled", "sandbox_unavailable"], indirect=True
+)
+async def test_confirm_reports_a_disabled_sandbox_as_a_tool_error(
+    client: httpx.AsyncClient, probe: _Probe, disabled_registry: str
+) -> None:
+    data = await _start(client)
+
+    resp = await _confirm(client, data["session_id"], data["pending_action"]["action_id"], True)
+
+    assert resp.status_code == 200
+    (result,) = resp.json()["tool_results"]
+    assert result["status"] == "error"
+
+
+async def test_normal_output_that_merely_mentions_disabled_stays_a_success(
+    probe: _Probe,
+) -> None:
+    probe.tool_output = {"status": "completed", "detail": "feature disabled upstream, unavailable"}
+    graph, config, action = await _paused_graph(probe)
+
+    final = await graph.ainvoke(_answer(action["action_id"], True), config)
+
+    (result,) = final["tool_results"]
+    assert result["status"] == "success"
+    assert "executed" in await _failed_statuses(graph, config)

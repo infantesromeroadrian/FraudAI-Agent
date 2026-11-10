@@ -104,6 +104,23 @@ def _build_llm(
     raise ValueError(msg)
 
 
+# Explicit status vocabulary of tools that declined to run (ToolImplementations
+# with the sandbox off: "disabled"; the stub tools: "unavailable").  Only this
+# declared status counts; free-form content is never inspected.
+_NOT_RUN_STATUSES = frozenset({"disabled", "unavailable"})
+
+
+def _declared_not_run(output: Any) -> dict[str, Any] | None:
+    """Failure fields when *output* declares the tool did not run, else ``None``."""
+    if not isinstance(output, dict) or output.get("status") not in _NOT_RUN_STATUSES:
+        return None
+    detail = output.get("error") or output.get("message") or f"Tool {output['status']}."
+    declined: dict[str, Any] = {"error": str(detail)}
+    if isinstance(output.get("error_code"), str):
+        declined["error_code"] = output["error_code"]
+    return declined
+
+
 def wrap_untrusted_tool_output(result: dict[str, Any]) -> str:
     """Encode one tool outcome as data for the model (see ``UNTRUSTED_OUTPUT_NOTICE``).
 
@@ -117,6 +134,8 @@ def wrap_untrusted_tool_output(result: dict[str, Any]) -> str:
         text = raw if isinstance(raw, str) else str(raw)
     else:
         text = str(result.get("error") or "No output")
+        if isinstance(result.get("error_code"), str):
+            text = f"{result['error_code']}: {text}"
     truncated = len(text) > MAX_TOOL_OUTPUT_CHARS
     encoded = (
         json.dumps(text[:MAX_TOOL_OUTPUT_CHARS], ensure_ascii=True)
@@ -380,6 +399,13 @@ class ClaudeAgentInvoker:
         except Exception as exc:
             logger.error("Tool '%s' execution failed: %s", tool_name, exc)
             return {**failure, "error": str(exc)}
+
+        declined = _declared_not_run(output)
+        if declined is not None:
+            # The tool answered, but its own contract says it did not run
+            # (sandbox off or unavailable): that is a failure, not a success.
+            logger.warning("Tool '%s' did not run: %s", tool_name, declined.get("error_code"))
+            return {**failure, **declined}
 
         logger.info("Tool '%s' executed successfully", tool_name)
         return {
