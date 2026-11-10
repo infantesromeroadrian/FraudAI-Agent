@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import type { ToolResult } from "@/lib/types";
+import { describeToolFailure } from "@/lib/hitl";
 
 // ---------------------------------------------------------------------------
 // Tool Result Card — collapsible display for agent tool execution results
@@ -54,6 +55,7 @@ export function ToolResultCard({ result: resultProp, toolResult }: ToolResultCar
 
   if (!result) return null;
   const style = STATUS_STYLES[result.status];
+  const failure = describeToolFailure(result);
 
   return (
     <div
@@ -120,6 +122,16 @@ export function ToolResultCard({ result: resultProp, toolResult }: ToolResultCar
           />
         </svg>
       </button>
+
+      {/* Explicit failure (e.g. sandbox_disabled / sandbox_unavailable) */}
+      {failure && (
+        <p
+          role="alert"
+          className="border-t border-red-500/30 px-4 py-2 text-sm text-red-300"
+        >
+          {failure}
+        </p>
+      )}
 
       {/* Content — JSON or error */}
       {expanded && (

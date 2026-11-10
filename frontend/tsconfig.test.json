@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "noEmit": false,
+    "incremental": false,
+    "outDir": ".test-build",
+    "rootDir": ".",
+    "plugins": [],
+    "jsx": "react-jsx",
+    "types": ["node"]
+  },
+  "include": ["src/lib/**/*.ts", "src/components/chat/ConfirmationDialog.tsx", "tests/**/*.ts", "tests/**/*.tsx"],
+  "exclude": ["node_modules", ".test-build"]
+}
