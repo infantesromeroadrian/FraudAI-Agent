@@ -562,3 +562,102 @@ async def test_a_tiny_prompt_window_keeps_the_pending_action_and_the_single_appr
     assert repeat.status_code == 409
     assert max(model.seen_lengths) <= 4, "model input stays bounded"
     assert session_context.active_session_id() is None
+
+
+# ---------------------------------------------------------------------------
+# Restoring from SQLite respects the quotas and the history bound
+# ---------------------------------------------------------------------------
+
+
+async def _seed(db: Database, rows: list[tuple[str, str, int]]) -> list[str]:
+    """Insert sessions (tenant, history length, in creation order); return their ids."""
+    ids: list[str] = []
+    for index, (tenant, history_length, _) in enumerate(rows):
+        session_id = f"00000000-0000-4000-8000-{index:012d}"
+        await db.create_session(session_id, tenant, "pro")
+        for turn in range(history_length):
+            await db.record_turn(session_id, f"agent-{turn}", max_history=10_000)
+        ids.append(session_id)
+    return ids
+
+
+async def test_restore_applies_tenant_and_global_quotas_and_the_history_bound(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "old.db")
+    await db.initialize()
+    ids = await _seed(db, [("tenant-a", 8, 0)] * 4)
+    manager = SessionManager(db=db, max_sessions=3, max_sessions_per_tenant=2, max_agent_history=3)
+
+    restored = await manager.load_from_db()
+
+    kept = manager.list_sessions("tenant-a")
+    assert restored == 2 == len(manager.list_sessions())
+    assert [s.session_id for s in kept] == ids[2:], "the newest sessions survive"
+    assert all(len(s.agent_history) == 3 for s in kept)
+    assert all(s.agent_history == ["agent-5", "agent-6", "agent-7"] for s in kept)
+    assert all(s.turn_count == 8 for s in kept), "the true total is preserved"
+    # Restoring is not destructive: nothing is deleted from the database.
+    for session_id in ids:
+        assert await db.get_session(session_id) is not None
+    await db.close()
+
+
+async def test_a_new_session_after_restore_stays_within_the_tenant_quota(tmp_path: Path) -> None:
+    db = Database(tmp_path / "old.db")
+    await db.initialize()
+    await _seed(db, [("tenant-a", 1, 0)] * 4)
+    manager = SessionManager(db=db, max_sessions=100, max_sessions_per_tenant=2)
+    await manager.load_from_db()
+
+    manager.create_session("tenant-a", "pro")
+
+    assert len(manager.list_sessions("tenant-a")) == 2
+    await manager.aclose()
+    await db.close()
+
+
+async def test_global_cap_on_restore_evicts_from_the_heaviest_tenant(tmp_path: Path) -> None:
+    db = Database(tmp_path / "old.db")
+    await db.initialize()
+    ids = await _seed(
+        db,
+        [("tenant-a", 0, 0), ("tenant-b", 0, 0), ("tenant-a", 0, 0), ("tenant-a", 0, 0)],
+    )
+    manager = SessionManager(db=db, max_sessions=3, max_sessions_per_tenant=10)
+
+    await manager.load_from_db()
+
+    assert manager.get_session(ids[1]) is not None, "the lighter tenant keeps its session"
+    assert manager.get_session(ids[0]) is None, "the heaviest tenant pays, oldest first"
+    assert len(manager.list_sessions()) == 3
+    await db.close()
+
+
+async def test_lowering_the_limits_between_runs_takes_effect_on_the_next_start(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "old.db")
+    await db.initialize()
+    await _seed(db, [("tenant-a", 5, 0)] * 4)
+    first = SessionManager(db=db)
+    assert await first.load_from_db() == 4
+
+    second = SessionManager(db=db, max_sessions_per_tenant=1, max_agent_history=2)
+
+    assert await second.load_from_db() == 1
+    only = second.list_sessions()[0]
+    assert len(only.agent_history) == 2
+    assert only.turn_count == 5
+    await db.close()
+
+
+async def test_restore_within_the_limits_is_unchanged(tmp_path: Path) -> None:
+    db = Database(tmp_path / "old.db")
+    await db.initialize()
+    await _seed(db, [("tenant-a", 2, 0), ("tenant-b", 1, 0)])
+    manager = SessionManager(db=db)
+
+    assert await manager.load_from_db() == 2
+    assert [len(s.agent_history) for s in manager.list_sessions()] == [2, 1]
+    await db.close()

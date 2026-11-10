@@ -38,6 +38,8 @@ Prometheus exposes histograms as `<name>_bucket`, `<name>_sum` and `<name>_count
 
 - `endpoint`: the matched route template (for example `/api/v1/sessions/{session_id}`). A
   request that matches no route is labelled `unmatched`, so scanners cannot create series.
+- `method`: one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`; any other
+  value the client sends is reported as `OTHER`, so invented methods cannot create series.
 - `status_code`: the HTTP status as a string. `/api/v1/chat/stream` is measured until the
   response starts, not until the last event.
 - `agent_name`, `target_agent`: `donna`, `harvey`, `louis`, `jessica`, `mike`, `rachel`

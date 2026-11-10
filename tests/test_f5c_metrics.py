@@ -588,3 +588,65 @@ async def test_scrape_token_does_not_expire_and_has_no_jwt_claims(scrape_app: Fa
     second = await _call(scrape_app, "GET", "/admin/metrics", cfg, headers=_bearer(SCRAPE_VALUE))
 
     assert first.status_code == second.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# The HTTP method label is a closed set
+# ---------------------------------------------------------------------------
+
+
+async def _send(method: str, path: str) -> int:
+    app = FastAPI()
+    app.add_middleware(MetricsMiddleware)
+    app.include_router(router, prefix="/api/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as http:
+        return (await http.request(method, path)).status_code
+
+
+async def test_invented_http_methods_share_one_label_in_counter_and_histogram() -> None:
+    count = (
+        "fraudai_requests_total",
+        {"method": "OTHER", "endpoint": "unmatched", "status_code": "404"},
+    )
+    hist = ("fraudai_request_duration_seconds_count", {"method": "OTHER", "endpoint": "unmatched"})
+    before = (_sample(count[0], **count[1]), _sample(hist[0], **hist[1]))
+
+    for index in range(3):
+        assert await _send(f"REVIEWVERB{index}", "/missing") == 404
+
+    assert _sample(count[0], **count[1]) - before[0] == 3
+    assert _sample(hist[0], **hist[1]) - before[1] == 3
+    for index in range(3):
+        raw = {"method": f"REVIEWVERB{index}", "endpoint": "unmatched", "status_code": "404"}
+        assert _sample("fraudai_requests_total", **raw) == 0
+        raw_hist = {"method": f"REVIEWVERB{index}", "endpoint": "unmatched"}
+        assert _sample("fraudai_request_duration_seconds_count", **raw_hist) == 0
+
+
+@pytest.mark.parametrize("method", ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def test_standard_http_methods_keep_their_own_label(method: str) -> None:
+    labels = {"method": method, "endpoint": "unmatched", "status_code": "404"}
+    before = _sample("fraudai_requests_total", **labels)
+
+    await _send(method, "/missing-standard")
+
+    assert _sample("fraudai_requests_total", **labels) - before == 1
+
+
+async def test_a_known_route_with_an_invented_method_is_still_bounded() -> None:
+    before = _sample(
+        "fraudai_requests_total", method="OTHER", endpoint="/api/v1/livez", status_code="405"
+    )
+
+    status = await _send("WEIRD", "/api/v1/livez")
+
+    assert status == 405
+    assert (
+        _sample(
+            "fraudai_requests_total", method="OTHER", endpoint="/api/v1/livez", status_code="405"
+        )
+        - before
+        == 1
+    )

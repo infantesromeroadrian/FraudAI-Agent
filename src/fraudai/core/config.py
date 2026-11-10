@@ -17,6 +17,16 @@ MIN_SCRAPE_TOKEN_LENGTH = 32
 _PASSWORD_HASH_FIELDS = 6  # scrypt:<n>:<r>:<p>:<salt>:<hash>
 
 
+def is_volatile_sqlite_path(path: str) -> bool:
+    """True for SQLite destinations that live only in memory or a throw-away temp file.
+
+    ``:memory:`` is a private in-memory database; an empty name makes SQLite use a
+    temporary on-disk database that is deleted on close. Both lose everything on restart.
+    The connection does not interpret ``file:`` URIs, so those are ordinary file names.
+    """
+    return path.strip() in ("", ":memory:")
+
+
 class Settings(BaseSettings):
     """FraudAI Agent configuration.
 
@@ -108,6 +118,17 @@ class Settings(BaseSettings):
             msg = (
                 "JWT_SECRET must be set to a random value of at least "
                 f"{_MIN_JWT_SECRET_LENGTH} characters when ENVIRONMENT={self.environment}"
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _require_durable_database_outside_development(self) -> Self:
+        """Staging and production persist sessions and feedback: the path must be a file."""
+        if self.environment != "development" and is_volatile_sqlite_path(self.database_path):
+            msg = (
+                "DATABASE_PATH must be a file path (not :memory: or empty) "
+                f"when ENVIRONMENT={self.environment}"
             )
             raise ValueError(msg)
         return self

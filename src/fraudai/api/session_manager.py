@@ -117,11 +117,12 @@ class SessionManager:
     # Sessions
     # ------------------------------------------------------------------
 
-    def _evict(self, session_id: str, reason: str) -> None:
+    def _evict(self, session_id: str, reason: str, *, delete_stored: bool = True) -> None:
         session = self._sessions.pop(session_id, None)
         if session is None:
             return
-        self._persist(lambda: self._db_delete_session(session_id))
+        if delete_stored:
+            self._persist(lambda: self._db_delete_session(session_id))
         logger.info(
             "Session evicted (%s): session_id=%s, tenant_id=%s",
             reason,
@@ -139,6 +140,27 @@ class SessionManager:
             heaviest = max(holders, key=lambda tenant: holders[tenant])
             victim = next(sid for sid, s in self._sessions.items() if s.tenant_id == heaviest)
             self._evict(victim, "global cap")
+
+    def _enforce_limits_after_restore(self) -> None:
+        """Bring restored sessions within the current quotas and history bound.
+
+        Memory only: stored rows are left alone, so lowering a limit by mistake never
+        destroys data; the surplus is simply not loaded (oldest first, heaviest tenant
+        first for the global cap). ``turn_count`` keeps the true total.
+        """
+        for session in self._sessions.values():
+            del session.agent_history[: -self._max_history]
+        by_tenant: dict[str, list[str]] = {}
+        for sid, session in self._sessions.items():  # creation order: oldest first
+            by_tenant.setdefault(session.tenant_id, []).append(sid)
+        for owned in by_tenant.values():
+            for sid in owned[: max(0, len(owned) - self._max_per_tenant)]:
+                self._evict(sid, "restore: tenant quota", delete_stored=False)
+        while len(self._sessions) > self._max_sessions:
+            holders = Counter(s.tenant_id for s in self._sessions.values())
+            heaviest = max(holders, key=lambda tenant: holders[tenant])
+            victim = next(sid for sid, s in self._sessions.items() if s.tenant_id == heaviest)
+            self._evict(victim, "restore: global cap", delete_stored=False)
 
     def create_session(self, tenant_id: str, tier: str) -> str:
         """Create a new session and return its ID."""
@@ -237,9 +259,11 @@ class SessionManager:
                 data = self._db._row_to_session_dict(row)
                 self._sessions[data["session_id"]] = SessionData(**data)
                 count += 1
-            ACTIVE_SESSIONS.set(len(self._sessions))
-            logger.info("Loaded %d sessions from database", count)
-            return count
+            self._enforce_limits_after_restore()
+            kept = len(self._sessions)
+            ACTIVE_SESSIONS.set(kept)
+            logger.info("Loaded %d sessions from database (%d kept within limits)", count, kept)
+            return kept
         except Exception:
             logger.exception("Failed to load sessions from database, starting fresh")
             return 0

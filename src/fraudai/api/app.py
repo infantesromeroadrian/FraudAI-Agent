@@ -32,7 +32,7 @@ from fraudai.api.logging_config import configure_logging
 from fraudai.api.middleware import MetricsMiddleware
 from fraudai.api.routes import router as api_router
 from fraudai.api.session_manager import SessionManager
-from fraudai.core.config import settings
+from fraudai.core.config import is_volatile_sqlite_path, settings
 from fraudai.core.database import Database, DatabaseUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -120,6 +120,9 @@ async def init_database(cfg: Settings) -> Database | None:
     deployment can never silently lose sessions and feedback to a memory-only fallback.
     Development degrades, loudly, to in-memory state.
     """
+    if cfg.environment != "development" and is_volatile_sqlite_path(cfg.database_path):
+        msg = f"DATABASE_PATH is a volatile destination; refusing to start in {cfg.environment}"
+        raise DatabaseUnavailableError(msg)
     db = Database(cfg.database_path)
     try:
         await db.initialize()

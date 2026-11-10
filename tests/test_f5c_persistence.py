@@ -333,3 +333,47 @@ async def test_concurrent_persistence_keeps_every_row(tmp_path: Path) -> None:
 
     stored = {row[0] for row in _rows(tmp_path / "burst.db", "SELECT session_id FROM sessions")}
     assert stored == set(ids)
+
+
+# ---------------------------------------------------------------------------
+# Outside development the database must be a real file, never a volatile one
+# ---------------------------------------------------------------------------
+
+VOLATILE_PATHS = [":memory:", "", "   ", " :memory: "]
+
+
+@pytest.mark.parametrize("environment", ["production", "staging"])
+@pytest.mark.parametrize("volatile", VOLATILE_PATHS)
+def test_non_development_rejects_volatile_database_paths(environment: str, volatile: str) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="DATABASE_PATH"):
+        Settings(
+            _env_file=None,
+            environment=environment,
+            jwt_secret=SYNTHETIC_SECRET,
+            database_path=volatile,
+        )
+
+
+@pytest.mark.parametrize("environment", ["production", "staging"])
+async def test_init_database_refuses_a_volatile_destination_even_if_settings_were_bypassed(
+    environment: str,
+) -> None:
+    cfg = _cfg("/unused", environment=environment).model_copy(update={"database_path": ":memory:"})
+
+    with pytest.raises(DatabaseUnavailableError, match="volatile"):
+        await init_database(cfg)
+
+
+def test_development_keeps_the_in_memory_option() -> None:
+    cfg = Settings(_env_file=None, environment="development", database_path=":memory:")
+
+    assert cfg.database_path == ":memory:"
+
+
+@pytest.mark.parametrize("environment", ["production", "staging"])
+def test_a_real_file_path_is_still_accepted(environment: str, tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path / "ok.db", environment=environment)
+
+    assert cfg.database_path.endswith("ok.db")

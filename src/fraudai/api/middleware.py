@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 # and written to every log line, so anything else (spaces, CR/LF, huge values) is replaced.
 _INBOUND_CORRELATION_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 UNMATCHED_ENDPOINT = "unmatched"
+# The method label comes from the client: anything outside the standard set shares one value.
+_KNOWN_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+UNKNOWN_METHOD = "OTHER"
 
 
 _PATH_PARAM = re.compile(r"\{([^}:]+)(?::[^}]*)?\}")
@@ -80,7 +83,9 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         call_next: RequestResponseEndpoint,
     ) -> Response:
         cid = _start_correlation(request)
-        method = request.method
+        method = request.method.upper()
+        if method not in _KNOWN_METHODS:
+            method = UNKNOWN_METHOD
 
         start = time.monotonic()
         response: Response = await call_next(request)

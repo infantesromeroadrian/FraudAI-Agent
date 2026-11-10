@@ -85,10 +85,14 @@ async def _get_donna_router() -> DonnaRouter:
     global _donna_router  # noqa: PLW0603
     async with _init_lock:
         if _donna_router is None:
+            # With Ollama selected, Donna must not receive the Groq key: it would send the
+            # user's ambiguous messages to a provider nobody chose. Other providers keep
+            # the previous behaviour.
+            groq_key = None if settings.llm_provider == "ollama" else settings.groq_api_key
             _donna_router = DonnaRouter(
                 ollama_host=settings.ollama_host,
                 model=settings.ollama_model,
-                groq_api_key=settings.groq_api_key or None,
+                groq_api_key=groq_key or None,
             )
     return _donna_router
 

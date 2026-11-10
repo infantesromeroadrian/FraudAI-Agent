@@ -14,7 +14,7 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -402,3 +402,60 @@ class TestSettings:
 
     def test_the_default_provider_is_unchanged(self) -> None:
         assert Settings(_env_file=None).llm_provider == "groq"
+
+
+# ---------------------------------------------------------------------------
+# Donna must not send the user's message to a provider that was not selected
+# ---------------------------------------------------------------------------
+
+AMBIGUOUS_MESSAGE = "zzzz qqqq xxxx"  # no keyword matches: Donna must ask an LLM
+
+
+@pytest.fixture()
+def fresh_donna(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(graph_module, "_donna_router", None)
+
+
+async def _classify_ambiguous(cfg: Settings) -> tuple[AsyncMock, AsyncMock]:
+    from fraudai.agents.donna import DonnaRouter
+
+    groq = AsyncMock(return_value={"agent": "harvey", "language": "es", "confidence": 0.9})
+    ollama = AsyncMock(return_value={"agent": "louis", "language": "es", "confidence": 0.9})
+    with (
+        patch.object(graph_module, "settings", cfg),
+        patch.object(DonnaRouter, "_call_groq", groq),
+        patch.object(DonnaRouter, "_call_ollama", ollama),
+    ):
+        await graph_module.classify_intent_local(AMBIGUOUS_MESSAGE)
+    return groq, ollama
+
+
+async def test_ollama_provider_never_gives_donna_the_groq_key(fresh_donna: None) -> None:
+    cfg = Settings(_env_file=None, **_kwargs(llm_provider="ollama"))
+
+    groq, ollama = await _classify_ambiguous(cfg)
+
+    assert groq.await_count == 0, "the message must not go to a provider that is not selected"
+    assert ollama.await_count == 1
+    assert graph_module._donna_router is not None
+    assert graph_module._donna_router._groq_api_key is None
+
+
+@pytest.mark.parametrize("provider", ["groq", "anthropic", "openai"])
+async def test_other_providers_keep_donnas_previous_groq_behaviour(
+    provider: str, fresh_donna: None
+) -> None:
+    cfg = Settings(_env_file=None, **_kwargs(llm_provider=provider))
+
+    groq, ollama = await _classify_ambiguous(cfg)
+
+    assert groq.await_count == 1
+    assert ollama.await_count == 0
+
+
+async def test_donna_without_any_groq_key_still_uses_ollama(fresh_donna: None) -> None:
+    cfg = Settings(_env_file=None, **_kwargs(llm_provider="groq", groq_api_key=""))
+
+    groq, ollama = await _classify_ambiguous(cfg)
+
+    assert (groq.await_count, ollama.await_count) == (0, 1)
