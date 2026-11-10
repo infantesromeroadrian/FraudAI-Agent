@@ -1,8 +1,8 @@
 """LLM agent invoker with multi-provider support.
 
-Supports Anthropic (Claude), Groq, and OpenAI-compatible providers.
-Uses ``ChatAnthropic``, ``ChatGroq``, or ``ChatOpenAI`` from langchain
-with tool binding, retry logic, and escalation detection.
+Supports Anthropic (Claude), Groq, OpenAI, and a local Ollama daemon (through its
+OpenAI-compatible API). Uses ``ChatAnthropic``, ``ChatGroq``, or ``ChatOpenAI`` from
+langchain with tool binding, retry logic, and escalation detection.
 """
 
 from __future__ import annotations
@@ -13,11 +13,20 @@ import logging
 import re
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from fraudai.agents.hitl import OFFENSIVE_TOOLS
-from fraudai.core.metrics import AGENT_INVOCATIONS, AGENT_LATENCY, TOKENS_USED
+from fraudai.core.config import settings
+from fraudai.core.metrics import (
+    AGENT_INVOCATIONS,
+    AGENT_LATENCY,
+    TOKEN_COST_ESTIMATED,
+    TOKENS_USED,
+    TOOL_CALLS,
+    TOOL_LATENCY,
+)
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -65,14 +74,49 @@ _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0  # seconds
 
 
+# Ollama's OpenAI-compatible endpoint requires an api_key field but ignores its value.
+# This literal is not a credential and is only ever sent to the configured Ollama host.
+OLLAMA_PLACEHOLDER_KEY = "ollama"
+
+
+def _ollama_openai_url(base_url: str | None) -> str:
+    """``http(s)://host:port`` of the daemon -> its OpenAI-compatible ``.../v1`` URL."""
+    parts = urlsplit((base_url or "").strip())
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        msg = "Ollama base_url must be an http(s) URL such as http://localhost:11434"
+        raise ValueError(msg)
+    path = parts.path.rstrip("/").removesuffix("/v1").rstrip("/")
+    return f"{parts.scheme}://{parts.netloc}{path}/v1"
+
+
 def _build_llm(
     provider: str,
     api_key: str,
     model: str,
     max_tokens: int,
     temperature: float,
+    base_url: str | None = None,
 ) -> BaseChatModel:
-    """Build the appropriate LangChain chat model for the given provider."""
+    """Build the appropriate LangChain chat model for the given provider.
+
+    ``base_url`` is accepted only for ``ollama``: allowing it elsewhere would let a
+    configuration mistake send a real provider key to a different host.
+    """
+    if base_url is not None and provider != "ollama":
+        msg = f"base_url is only supported for the ollama provider, not {provider}"
+        raise ValueError(msg)
+    if provider == "ollama":
+        endpoint = _ollama_openai_url(base_url)  # validate before importing the extra
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(  # type: ignore[call-arg,no-any-return]
+            model=model,
+            base_url=endpoint,
+            openai_api_key=OLLAMA_PLACEHOLDER_KEY,  # the passed api_key is deliberately unused
+            max_tokens=max_tokens,
+            temperature=temperature,
+            max_retries=0,  # the invoker already retries; avoid multiplying cloud requests
+        )
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
@@ -100,7 +144,7 @@ def _build_llm(
             max_tokens=max_tokens,
             temperature=temperature,
         )
-    msg = f"Unknown LLM provider: {provider}. Supported: anthropic, groq, openai"
+    msg = f"Unknown LLM provider: {provider}. Supported: anthropic, groq, openai, ollama"
     raise ValueError(msg)
 
 
@@ -159,7 +203,7 @@ def wrap_untrusted_tool_output(result: dict[str, Any]) -> str:
 class ClaudeAgentInvoker:
     """Invokes LLM agents via langchain with tool use.
 
-    Supports multiple providers (Anthropic, Groq, OpenAI) configured via
+    Supports multiple providers (Anthropic, Groq, OpenAI, Ollama) configured via
     the ``provider`` parameter. Encapsulates model construction, tool
     binding, retry logic, and escalation detection.
     """
@@ -171,8 +215,9 @@ class ClaudeAgentInvoker:
         provider: str = "anthropic",
         max_tokens: int = 4096,
         temperature: float = 0.3,
+        base_url: str | None = None,
     ) -> None:
-        self._model = _build_llm(provider, api_key, model, max_tokens, temperature)
+        self._model = _build_llm(provider, api_key, model, max_tokens, temperature, base_url)
         self._model_name = model
         self._provider = provider
         logger.info(
@@ -313,11 +358,32 @@ class ClaudeAgentInvoker:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _window(messages: list[Any], limit: int) -> list[Any]:
+        """The most recent messages, starting on a user turn, never without the last one.
+
+        Only what is SENT to the model is cut; the stored conversation (and with it any
+        pending approval in the checkpoint) is untouched.
+        """
+        if len(messages) <= limit:
+            return list(messages)
+        start = len(messages) - limit
+        for index in range(start, len(messages)):
+            if isinstance(messages[index], HumanMessage):
+                return messages[index:]
+        # No user turn inside the window: keep from the latest user message instead.
+        for index in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[index], HumanMessage):
+                return messages[index:]
+        return messages[start:]
+
+    @staticmethod
     def _build_messages(system_prompt: str, state: AgentState) -> list[Any]:
-        """Build the message list from system prompt and conversation history."""
+        """Build the message list: system prompt plus a bounded window of the history."""
         messages: list[Any] = [SystemMessage(content=system_prompt)]
-        state_messages = state.get("messages") or []
-        messages.extend(state_messages)
+        state_messages = list(state.get("messages") or [])
+        messages.extend(
+            ClaudeAgentInvoker._window(state_messages, settings.history_window_messages)
+        )
         return messages
 
     def _bind_tools(self, tools: list[Any]) -> Any:
@@ -395,23 +461,31 @@ class ClaudeAgentInvoker:
 
         if tool_name not in tool_map:
             logger.warning("Tool '%s' not found in available tools", tool_name)
+            # The name comes from the model: one shared label keeps cardinality bounded.
+            TOOL_CALLS.labels(tool_name="unknown", status="error").inc()
             return {**failure, "error": f"Tool '{tool_name}' not found in agent tool list"}
 
+        start = time.monotonic()
         try:
-            start = time.monotonic()
             output = await tool_map[tool_name].ainvoke(tool_args)
-            duration_ms = int((time.monotonic() - start) * 1000)
         except Exception as exc:
+            TOOL_LATENCY.labels(tool_name=tool_name).observe(time.monotonic() - start)
+            TOOL_CALLS.labels(tool_name=tool_name, status="error").inc()
             logger.error("Tool '%s' execution failed: %s", tool_name, exc)
             return {**failure, "error": str(exc)}
+        elapsed = time.monotonic() - start
+        duration_ms = int(elapsed * 1000)
+        TOOL_LATENCY.labels(tool_name=tool_name).observe(elapsed)
 
         declined = _declared_not_run(output)
         if declined is not None:
             # The tool answered, but its own contract says it did not run
             # (sandbox off or unavailable): that is a failure, not a success.
+            TOOL_CALLS.labels(tool_name=tool_name, status="error").inc()
             logger.warning("Tool '%s' did not run: %s", tool_name, declined.get("error_code"))
             return {**failure, **declined}
 
+        TOOL_CALLS.labels(tool_name=tool_name, status="success").inc()
         logger.info("Tool '%s' executed successfully", tool_name)
         return {
             "tool_name": tool_name,
@@ -542,6 +616,14 @@ class ClaudeAgentInvoker:
             TOKENS_USED.labels(agent_name=agent_name, direction="input").inc(input_tokens)
         if output_tokens:
             TOKENS_USED.labels(agent_name=agent_name, direction="output").inc(output_tokens)
+
+        # Cost only with a configured tariff (both prices). Providers without a per-token
+        # price (Ollama on a subscription) have an unknown cost: omitted, never zero.
+        input_price = settings.llm_input_cost_per_mtok_usd
+        output_price = settings.llm_output_cost_per_mtok_usd
+        if input_price is not None and output_price is not None and (input_tokens or output_tokens):
+            cost = (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+            TOKEN_COST_ESTIMATED.labels(agent_name=agent_name).inc(cost)
 
     def _log_token_usage(self, ai_message: AIMessage, agent_name: str) -> None:
         """Log token usage from the response metadata if available."""

@@ -21,7 +21,6 @@ from fraudai.api.auth import User
 from fraudai.api.session_manager import SessionManager
 
 # Test placeholder -- not a real credential
-_TEST_ANTHROPIC_PLACEHOLDER = "test-not-a-real-key"
 
 
 # ---------------------------------------------------------------------------
@@ -181,17 +180,6 @@ def _override_auth(app: FastAPI) -> None:
 
     app.dependency_overrides[get_current_user] = _auth_override
     app.dependency_overrides[get_admin_user] = _admin_override
-
-
-def _mock_settings(with_claude: bool = False) -> MagicMock:
-    """Create a mock settings object for health checks."""
-    values = {
-        "ollama_host": "http://localhost:11434",
-        "llm_provider": "anthropic" if with_claude else "groq",
-        "anthropic_api_key": _TEST_ANTHROPIC_PLACEHOLDER if with_claude else "",
-        "groq_api_key": "",
-    }
-    return MagicMock(**values)
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +359,9 @@ async def test_chat_stream_error_yields_error_event(
     events = [json.loads(line.removeprefix("data: ")) for line in lines]
     error_events = [e for e in events if e["type"] == "error"]
     assert len(error_events) == 1
-    assert "Stream failure" in error_events[0]["message"]
+    # The internal cause stays in the server log; the client gets a generic message.
+    assert "Stream failure" not in error_events[0]["message"]
+    assert error_events[0]["code"] == "agent_error"
 
 
 # ---------------------------------------------------------------------------
@@ -719,25 +709,35 @@ async def test_submit_feedback_invalid_rating(client: httpx.AsyncClient) -> None
 # ---------------------------------------------------------------------------
 
 
-async def test_health_all_healthy(client: httpx.AsyncClient, mock_store: MagicMock) -> None:
+async def _monitor_with(
+    app: FastAPI, *, qdrant: bool, ollama: bool, llm: bool, corpus: str | None = "v2024.01"
+) -> None:
+    """Install a refreshed health monitor whose checks return the given outcomes."""
+    from fraudai.api.health import HealthMonitor
+
+    def check(ok: bool) -> Any:
+        async def run() -> bool:
+            return ok
+
+        return run
+
+    async def corpus_probe() -> str | None:
+        return corpus
+
+    monitor = HealthMonitor(
+        {"qdrant": check(qdrant), "ollama": check(ollama), "llm": check(llm)},
+        frozenset({"qdrant", "llm"}),
+        corpus_version_probe=corpus_probe,
+    )
+    await monitor.refresh()
+    app.state.health_monitor = monitor
+
+
+async def test_health_all_healthy(client: httpx.AsyncClient, app: FastAPI) -> None:
     """Health check returns 'healthy' when all services are up."""
-    with patch("fraudai.api.routes.httpx_client.AsyncClient") as mock_httpx:
-        mock_client_instance = AsyncMock()
-        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_client_instance)
-        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
+    await _monitor_with(app, qdrant=True, ollama=True, llm=True)
 
-        # Ollama responds OK
-        ollama_resp = MagicMock()
-        ollama_resp.status_code = 200
-
-        # Claude API responds (405 = reachable)
-        claude_resp = MagicMock()
-        claude_resp.status_code = 405
-
-        mock_client_instance.get = AsyncMock(side_effect=[ollama_resp, claude_resp])
-
-        with patch("fraudai.api.routes.settings", _mock_settings(with_claude=True)):
-            resp = await client.get("/api/v1/health")
+    resp = await client.get("/api/v1/health")
 
     assert resp.status_code == 200
     data = resp.json()
@@ -748,20 +748,11 @@ async def test_health_all_healthy(client: httpx.AsyncClient, mock_store: MagicMo
     assert data["corpus_version"] == "v2024.01"
 
 
-async def test_health_degraded(client: httpx.AsyncClient, mock_store: MagicMock) -> None:
+async def test_health_degraded(client: httpx.AsyncClient, app: FastAPI) -> None:
     """Health check returns 'degraded' when some services are down."""
-    mock_store.health_check = AsyncMock(return_value=True)
+    await _monitor_with(app, qdrant=True, ollama=False, llm=False)
 
-    with patch("fraudai.api.routes.httpx_client.AsyncClient") as mock_httpx:
-        mock_client_instance = AsyncMock()
-        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_client_instance)
-        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        # Ollama fails
-        mock_client_instance.get = AsyncMock(side_effect=ConnectionError("Ollama down"))
-
-        with patch("fraudai.api.routes.settings", _mock_settings(with_claude=False)):
-            resp = await client.get("/api/v1/health")
+    resp = await client.get("/api/v1/health")
 
     assert resp.status_code == 200
     data = resp.json()
@@ -769,20 +760,11 @@ async def test_health_degraded(client: httpx.AsyncClient, mock_store: MagicMock)
     assert data["qdrant"] is True
 
 
-async def test_health_unhealthy(client: httpx.AsyncClient, mock_store: MagicMock) -> None:
+async def test_health_unhealthy(client: httpx.AsyncClient, app: FastAPI) -> None:
     """Health check returns 'unhealthy' when all services are down."""
-    mock_store.health_check = AsyncMock(return_value=False)
-    mock_store.get_corpus_version = AsyncMock(side_effect=Exception("no connection"))
+    await _monitor_with(app, qdrant=False, ollama=False, llm=False, corpus=None)
 
-    with patch("fraudai.api.routes.httpx_client.AsyncClient") as mock_httpx:
-        mock_client_instance = AsyncMock()
-        mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_client_instance)
-        mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        mock_client_instance.get = AsyncMock(side_effect=ConnectionError("All down"))
-
-        with patch("fraudai.api.routes.settings", _mock_settings(with_claude=False)):
-            resp = await client.get("/api/v1/health")
+    resp = await client.get("/api/v1/health")
 
     assert resp.status_code == 200
     data = resp.json()
@@ -815,21 +797,16 @@ async def test_auth_required_without_override(app: FastAPI) -> None:
 
 
 async def test_health_no_auth_required(app: FastAPI) -> None:
-    """Health endpoint does not require authentication."""
-    # Health endpoint has no Depends(get_current_user), so it should work
-    # even without the override -- but we need to mock external calls
+    """Health endpoint does not require authentication and calls no dependency."""
+    from fraudai.api.auth import get_current_user
+
+    app.dependency_overrides.pop(get_current_user, None)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        with patch("fraudai.api.routes.httpx_client.AsyncClient") as mock_httpx:
-            mock_client_instance = AsyncMock()
-            mock_httpx.return_value.__aenter__ = AsyncMock(return_value=mock_client_instance)
-            mock_httpx.return_value.__aexit__ = AsyncMock(return_value=False)
-            mock_client_instance.get = AsyncMock(side_effect=ConnectionError())
+        resp = await ac.get("/api/v1/health")
 
-            with patch("fraudai.api.routes.settings", _mock_settings(with_claude=False)):
-                resp = await ac.get("/api/v1/health")
-                # Should return 200 regardless of auth state
-                assert resp.status_code == 200
+    assert resp.status_code == 200  # no monitor snapshot yet: unhealthy, but never an error
+    app.dependency_overrides[get_current_user] = _auth_override
 
 
 # ---------------------------------------------------------------------------
