@@ -114,10 +114,15 @@ def _declared_not_run(output: Any) -> dict[str, Any] | None:
     """Failure fields when *output* declares the tool did not run, else ``None``."""
     if not isinstance(output, dict) or output.get("status") not in _NOT_RUN_STATUSES:
         return None
-    detail = output.get("error") or output.get("message") or f"Tool {output['status']}."
-    declined: dict[str, Any] = {"error": str(detail)}
+    detail = str(output.get("error") or output.get("message") or f"Tool {output['status']}.")
+    declined: dict[str, Any] = {"error": detail}
+    # ``result`` is where API clients read a tool's payload: expose only this
+    # small declared-failure record, not arbitrary internal error details.
+    payload: dict[str, Any] = {"status": output["status"], "error": detail}
     if isinstance(output.get("error_code"), str):
         declined["error_code"] = output["error_code"]
+        payload["error_code"] = output["error_code"]
+    declined["result"] = payload
     return declined
 
 

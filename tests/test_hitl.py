@@ -960,6 +960,12 @@ async def test_confirm_reports_a_disabled_sandbox_as_a_tool_error(
     assert resp.status_code == 200
     (result,) = resp.json()["tool_results"]
     assert result["status"] == "error"
+    # The client still learns which explicit condition stopped the tool, and why.
+    assert result["result"] == {
+        "status": "disabled",
+        "error_code": disabled_registry,
+        "error": f"synthetic reason for {disabled_registry}",
+    }
 
 
 async def test_normal_output_that_merely_mentions_disabled_stays_a_success(

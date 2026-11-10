@@ -74,7 +74,11 @@ class ToolResult(BaseModel):
     )
     result: dict[str, object] | None = Field(
         default=None,
-        description="Tool output payload. None when status is 'pending' or 'error'.",
+        description=(
+            "Tool output payload. None when status is 'pending', or 'error' without a "
+            "declared reason; a tool that declined to run (sandbox disabled/unavailable) "
+            "reports {status, error_code, error} here."
+        ),
     )
     duration_ms: int = Field(
         ge=0,
